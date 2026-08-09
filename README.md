@@ -145,7 +145,9 @@ The implementation pins the risky engine environment:
 | `vllm-tpu` | 0.26.0 |
 | `tpu-inference` | 0.26.0 (engine dependency) |
 | `uv` | 0.12.3 |
+| `jax` / `jaxlib` | 0.10.2 |
+| `torch` | 2.10.0 |
+| `transformers` (engine) | 5.14.1 |
 
 Exact validation results and the last successful end-to-end command are
 tracked in [`docs/VALIDATION.md`](docs/VALIDATION.md).
-

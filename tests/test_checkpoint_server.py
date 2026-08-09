@@ -74,9 +74,10 @@ class ServerCommandTests(unittest.TestCase):
         self.assertIn("--tensor-parallel-size 8", joined)
         self.assertIn("--max-num-seqs 1", joined)
         self.assertIn("--reasoning-parser gemma4", joined)
+        self.assertIn("--no-enable-log-requests", joined)
+        self.assertNotIn("--disable-log-requests", joined)
         self.assertNotIn("0.0.0.0", joined)
 
 
 if __name__ == "__main__":
     unittest.main()
-

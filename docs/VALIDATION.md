@@ -13,13 +13,17 @@
 - `vllm-tpu==0.26.0`
 - `tpu-inference==0.26.0`
 - `uv==0.12.3`
+- `jax==0.10.2`
+- `jaxlib==0.10.2`
+- `torch==2.10.0`
+- `transformers==5.14.1`
 
 ## Validation stages
 
-- [ ] Lightweight unit tests
-- [ ] Clean local `main` pushed and remote SHA confirmed
-- [ ] Binary-only vLLM TPU setup
-- [ ] Engine import/version validation without model loading
+- [x] Lightweight unit tests (23 passing before setup)
+- [x] Clean local `main` pushed and remote SHA confirmed
+- [x] Binary-only vLLM TPU setup
+- [x] Engine version/serve-flag validation without model loading
 - [ ] All eight TPUs confirmed through runtime telemetry
 - [ ] Gemma 4 model loaded with calculated context
 - [ ] Streamed reasoning and response
@@ -29,4 +33,3 @@
 ## Successful command
 
 Pending end-to-end validation.
-

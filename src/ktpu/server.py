@@ -48,7 +48,7 @@ def build_vllm_command(
         "1",
         "--generation-config",
         "vllm",
-        "--disable-log-requests",
+        "--no-enable-log-requests",
         "--limit-mm-per-prompt",
         json.dumps({"image": 0, "audio": 0}, separators=(",", ":")),
     ]
@@ -198,4 +198,3 @@ def launch_server(
         ),
         cpus,
     )
-
