@@ -32,8 +32,10 @@ def build_vllm_command(
     max_model_len: int,
     enable_thinking: bool,
 ) -> list[str]:
+    bootstrap = Path(__file__).with_name("engine_bootstrap.py")
     command = [
-        str(installation.executable),
+        str(installation.python),
+        str(bootstrap),
         "serve",
         model,
         "--host",
@@ -86,7 +88,7 @@ class ServerProcess:
             if returncode is not None:
                 raise EngineError(
                     f"vLLM exited with status {returncode} before becoming ready.\n"
-                    f"{tail(self.state.log_path, 50)}"
+                    f"{tail(self.state.log_path, 120)}"
                 )
             try:
                 response = httpx.get(health_url, timeout=2.0)
@@ -99,7 +101,7 @@ class ServerProcess:
             time.sleep(1.0)
         raise EngineError(
             f"vLLM did not become ready within {timeout:.0f} seconds.\n"
-            f"{tail(self.state.log_path, 50)}"
+            f"{tail(self.state.log_path, 120)}"
         )
 
     def stop(self, timeout: float = 20.0) -> None:
@@ -161,6 +163,8 @@ def launch_server(
     env, cpus = bounded_environment(cpu_limit=cpu_limit)
     env.setdefault("HF_HOME", str(Path.home() / ".cache/huggingface"))
     env.setdefault("JAX_COMPILATION_CACHE_DIR", str(Path.home() / ".cache/ktpu/xla"))
+    if os.environ.get("TPU_ACCELERATOR_TYPE", "").lower().startswith("v5litepod"):
+        env["KTPU_STRIP_DYNAMIC_SMEM_FLAG"] = "1"
     try:
         process = subprocess.Popen(
             command,

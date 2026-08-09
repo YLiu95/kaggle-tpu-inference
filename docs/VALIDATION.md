@@ -33,3 +33,12 @@
 ## Successful command
 
 Pending end-to-end validation.
+
+## Troubleshooting record
+
+- First server initialization exposed a Kaggle host-runtime incompatibility:
+  `tpu-inference 0.26.0` injects
+  `--xla_tpu_use_dynamic_smem_negotiation=true`, while the Kaggle v5litepod
+  runtime rejects that flag. The tracked engine bootstrap now removes only
+  this unsupported workaround flag on `v5litepod` before libtpu
+  initialization. No model weights were loaded during the failed attempt.

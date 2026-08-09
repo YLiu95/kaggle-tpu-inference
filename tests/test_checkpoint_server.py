@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ktpu.checkpoint import verify_checkpoint
 from ktpu.engine import EngineInstallation
+from ktpu.engine_bootstrap import strip_unsupported_libtpu_flags
 from ktpu.errors import CheckpointError
 from ktpu.server import build_vllm_command
 
@@ -70,6 +71,8 @@ class ServerCommandTests(unittest.TestCase):
             enable_thinking=True,
         )
         joined = " ".join(command)
+        self.assertEqual(command[0], "/engine/bin/python")
+        self.assertIn("engine_bootstrap.py", command[1])
         self.assertIn("--host 127.0.0.1", joined)
         self.assertIn("--tensor-parallel-size 8", joined)
         self.assertIn("--max-num-seqs 1", joined)
@@ -77,6 +80,16 @@ class ServerCommandTests(unittest.TestCase):
         self.assertIn("--no-enable-log-requests", joined)
         self.assertNotIn("--disable-log-requests", joined)
         self.assertNotIn("0.0.0.0", joined)
+
+    def test_kaggle_libtpu_compatibility_flag_is_removed(self) -> None:
+        value = (
+            "--xla_tpu_use_dynamic_smem_negotiation=true "
+            "--another_supported_flag=true"
+        )
+        self.assertEqual(
+            strip_unsupported_libtpu_flags(value),
+            "--another_supported_flag=true",
+        )
 
 
 if __name__ == "__main__":
