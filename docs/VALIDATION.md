@@ -41,4 +41,8 @@ Pending end-to-end validation.
   `--xla_tpu_use_dynamic_smem_negotiation=true`, while the Kaggle v5litepod
   runtime rejects that flag. The tracked engine bootstrap now removes only
   this unsupported workaround flag on `v5litepod` before libtpu
-  initialization. No model weights were loaded during the failed attempt.
+  initialization. Because vLLM's EngineCore reloads the plugin in a child
+  process, descendants also inherit Abseil's narrow `--undefok` allowlist for
+  this one flag. A direct bounded `jax.devices()` check then confirmed all
+  eight TPU devices. No model weights were loaded during either failed server
+  attempt.

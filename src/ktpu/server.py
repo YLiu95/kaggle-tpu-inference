@@ -16,6 +16,7 @@ import psutil
 from ktpu.checkpoint import Checkpoint
 from ktpu.constants import kaggle_mirror_dir, state_dir
 from ktpu.engine import EngineInstallation
+from ktpu.engine_bootstrap import add_unknown_flag_allowlist
 from ktpu.errors import EngineError
 from ktpu.restrictions import bounded_environment, make_preexec_fn
 from ktpu.state import ServerState, remove_server_state, save_server_state
@@ -165,6 +166,12 @@ def launch_server(
     env.setdefault("JAX_COMPILATION_CACHE_DIR", str(Path.home() / ".cache/ktpu/xla"))
     if os.environ.get("TPU_ACCELERATOR_TYPE", "").lower().startswith("v5litepod"):
         env["KTPU_STRIP_DYNAMIC_SMEM_FLAG"] = "1"
+        # EngineCore is a fresh Python process and reloads the TPU plugin,
+        # which injects the unsupported flag again. Abseil's undefok allowlist
+        # must therefore be inherited by every descendant.
+        env["LIBTPU_INIT_ARGS"] = add_unknown_flag_allowlist(
+            env.get("LIBTPU_INIT_ARGS", "")
+        )
     try:
         process = subprocess.Popen(
             command,

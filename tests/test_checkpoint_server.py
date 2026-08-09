@@ -8,7 +8,10 @@ from pathlib import Path
 
 from ktpu.checkpoint import verify_checkpoint
 from ktpu.engine import EngineInstallation
-from ktpu.engine_bootstrap import strip_unsupported_libtpu_flags
+from ktpu.engine_bootstrap import (
+    add_unknown_flag_allowlist,
+    strip_unsupported_libtpu_flags,
+)
 from ktpu.errors import CheckpointError
 from ktpu.server import build_vllm_command
 
@@ -89,6 +92,17 @@ class ServerCommandTests(unittest.TestCase):
         self.assertEqual(
             strip_unsupported_libtpu_flags(value),
             "--another_supported_flag=true",
+        )
+        self.assertEqual(
+            add_unknown_flag_allowlist("--another_supported_flag=true"),
+            "--another_supported_flag=true "
+            "--undefok=xla_tpu_use_dynamic_smem_negotiation",
+        )
+        self.assertEqual(
+            add_unknown_flag_allowlist(
+                "--undefok=xla_tpu_use_dynamic_smem_negotiation"
+            ),
+            "--undefok=xla_tpu_use_dynamic_smem_negotiation",
         )
 
 
