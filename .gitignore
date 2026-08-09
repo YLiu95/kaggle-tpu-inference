@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+
+# Runtime state, logs, model weights, and caches
+.ktpu/
+logs/
+*.csv
+*.log
+*.pid
+*.lock
+*.safetensors
+*.bin
+*.gguf
+*.ckpt
+huggingface/
+models/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*token*
+*secret*
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
