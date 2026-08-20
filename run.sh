@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Streaming inference with a live TPU/throughput dashboard.
-#   bash run.sh "prompt"                 -> dashboard
-#   bash run.sh --plain "prompt"         -> plain streaming
-# Any run_inference.py flag can be passed through.
+#   bash run.sh "prompt"                          -> dashboard
+#   bash run.sh "prompt" --plain                  -> plain streaming
+#   bash run.sh "prompt" --max-new-tokens 512     -> any run_inference.py flag
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,11 +19,10 @@ for _ in $(seq 1 30); do
 done
 
 args=()
-prompt=""
-for a in "$@"; do
-  if [[ "$a" == -* ]]; then args+=("$a"); else prompt="$a"; fi
-done
-[[ -n "$prompt" ]] && args+=(--prompt "$prompt")
+if [[ $# -gt 0 && "$1" != -* ]]; then
+  args+=(--prompt "$1"); shift
+fi
+args+=("$@")
 
 cd "$ROOT"
 exec python3 -u run_inference.py "${args[@]}"

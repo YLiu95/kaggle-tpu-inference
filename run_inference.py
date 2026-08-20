@@ -95,18 +95,18 @@ def header_panel(engine: Engine, model_id: str) -> Panel:
 
 
 def tpu_panel(snap, tokens_per_s: float, engine: Engine, pos: int) -> Panel:
-    t = Table(box=None, pad_edge=False, expand=True)
+    t = Table(box=None, pad_edge=False)
     t.add_column("chip", justify="right", style="bold")
     t.add_column("kind")
     t.add_column("HBM used", justify="right")
     t.add_column("HBM total", justify="right")
-    t.add_column("%", justify="right")
+    t.add_column("used %", justify="right")
     t.add_column("peak", justify="right")
     t.add_column("duty", justify="right")
     for c in snap.chips:
         pct = 100.0 * c.hbm_used / c.hbm_limit if c.hbm_limit else 0.0
         colour = "green" if pct < 75 else ("yellow" if pct < 90 else "red")
-        duty = f"{c.duty_cycle:5.1f}%" if c.duty_cycle is not None else "  n/a"
+        duty = f"{c.duty_cycle:5.1f}%" if c.duty_cycle is not None else "n/a"
         t.add_row(
             str(c.index),
             c.kind,
@@ -119,18 +119,24 @@ def tpu_panel(snap, tokens_per_s: float, engine: Engine, pos: int) -> Panel:
     n = max(1, len(snap.chips))
     flops = 2 * engine.active_params * tokens_per_s
     bw = (2 * engine.active_params + kv_bytes_per_token(engine.cfg) * pos) * tokens_per_s
+    busy = min(100.0, 100.0 * tokens_per_s * engine.decode_step_seconds)
     foot = Table.grid(padding=(0, 2))
     foot.add_column(style="bold cyan", justify="right")
     foot.add_column()
     foot.add_row(
         "aggregate",
-        f"HBM {fmt_gb(snap.hbm_used)} / {fmt_gb(snap.hbm_limit)} GiB   "
-        f"duty {('%.1f%%' % snap.mean_duty) if snap.mean_duty is not None else 'n/a'}   "
-        f"[dim]src={snap.duty_source}[/]",
+        f"HBM {fmt_gb(snap.hbm_used)} / {fmt_gb(snap.hbm_limit)} GiB over {n} chips   "
+        f"libtpu duty {('%.1f%%' % snap.mean_duty) if snap.mean_duty is not None else 'n/a'} "
+        f"[dim]({snap.duty_source})[/]",
+    )
+    foot.add_row(
+        "tensorcore",
+        f"[bold]{busy:5.1f}%[/] busy [dim](measured: {1000 * engine.decode_step_seconds:.2f} ms "
+        f"device time per decode step)[/]",
     )
     foot.add_row(
         "achieved",
-        f"{flops / 1e12:6.2f} TFLOP/s ({100 * flops / peak_flops(n):.2f}% of peak)   "
+        f"{flops / 1e12:6.2f} TFLOP/s ({100 * flops / peak_flops(n):.2f}% of bf16 peak)   "
         f"{bw / 1e9:7.1f} GB/s ({100 * bw / peak_bandwidth(n):.1f}% of HBM BW)",
     )
     foot.add_row("host", f"RSS {snap.host_rss_gb:.1f} GB   CPU {snap.host_cpu_pct:.0f}%")
@@ -180,7 +186,7 @@ def main() -> int:
     ap.add_argument("--system", default=None)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--model-dir", default=None)
-    ap.add_argument("--max-new-tokens", type=int, default=512)
+    ap.add_argument("--max-new-tokens", type=int, default=768)
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
@@ -218,7 +224,8 @@ def main() -> int:
         ct = engine.compile_all()
     console.print(
         f"[green]compiled[/] prefill {ct['prefill_compile_s']:.1f}s, "
-        f"decode {ct['decode_compile_s']:.1f}s"
+        f"decode {ct['decode_compile_s']:.1f}s, "
+        f"steady-state decode step {1000 * ct['decode_step_s']:.2f} ms"
     )
 
     messages = []
@@ -246,7 +253,6 @@ def main() -> int:
     splitter = ChannelSplitter()
     segments: list[tuple[str, str]] = []
     stamps: deque[float] = deque(maxlen=24)
-    counts = {"reasoning": 0, "answer": 0}
 
     metrics = {
         "ttft": 0.0, "prompt_tokens": len(prompt_ids), "prefill_tps": 0.0,
@@ -291,7 +297,7 @@ def main() -> int:
             if ev["kind"] == "decode":
                 stamps.append(ev["t"])
         elapsed = time.perf_counter() - (t_first or time.perf_counter())
-        n = detok.ids.__len__()
+        n = len(detok.ids)
         print(f"\n\n[{n} tokens, {(n - 1) / max(elapsed, 1e-9):.2f} tok/s]")
         monitor.stop()
         return 0
@@ -319,7 +325,6 @@ def main() -> int:
 
             for mode, chunk in splitter.feed(detok.add(ev["token"])):
                 segments.append((mode, chunk))
-                counts[mode] += 0
             metrics["phase"] = "reasoning" if splitter.mode == "reasoning" else "answering"
             if splitter.mode == "reasoning":
                 metrics["reasoning_tokens"] += 1
@@ -335,9 +340,10 @@ def main() -> int:
         live.update(render())
 
     monitor.stop()
-    full = "".join(c for m, c in segments if m == "answer")
+    full = "".join(c for m, c in segments if m == "answer").strip()
     console.rule("[bold green]final answer")
-    console.print(full.strip())
+    console.print(full or "[yellow](token budget consumed by the reasoning channel; "
+                         "raise --max-new-tokens)[/]")
     console.rule()
     console.print(
         f"[bold]TTFT[/] {metrics['ttft'] * 1000:.0f} ms   "

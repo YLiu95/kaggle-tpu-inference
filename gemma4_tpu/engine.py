@@ -50,6 +50,7 @@ class Engine:
         self.param_bytes = param_bytes(self.cfg)
         self.cache_bytes = M.cache_bytes(self.cfg, batch, max_len)
         self.active_params = active_params_per_token(self.cfg)
+        self.decode_step_seconds = 0.0
 
     # ---------------------------------------------------------------- jitted steps
     def _build_prefill(self, t: int):
@@ -121,6 +122,19 @@ class Engine:
         )
         jax.block_until_ready(tok)
         out["decode_compile_s"] = time.perf_counter() - t0
+
+        # Blocking device time for a single decode step: used as the reference for the
+        # measured TensorCore-busy percentage (libtpu's duty-cycle gRPC is dead on Kaggle).
+        n = 8
+        t0 = time.perf_counter()
+        for _ in range(n):
+            tok, self.cache, pos = self.decode_fn()(
+                self.params, tok, self.cache, pos, key, temp, top_p
+            )
+        jax.block_until_ready(tok)
+        self.decode_step_seconds = (time.perf_counter() - t0) / n
+        out["decode_step_s"] = self.decode_step_seconds
+
         self.reset_cache()
         return out
 
