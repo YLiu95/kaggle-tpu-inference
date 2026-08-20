@@ -46,10 +46,12 @@ open("/root/.gemma4_model_dir", "w").write(p)
 PY
 
 export GEMMA4_MODEL_DIR="$(cat /root/.gemma4_model_dir)"
-echo "==> Warming the XLA compilation cache (one-off, ~6 min; later runs start in ~40 s)"
+echo "==> Warming the XLA compilation cache (one-off, ~7 min)"
 cd "$ROOT"
 python3 -u bench.py --steps 8
 
 echo
 echo "Setup complete. Weights: $GEMMA4_MODEL_DIR"
 echo "Run:  bash run.sh \"your prompt here\""
+echo "      (~3.5 min from launch to first token: 15 s weight load + JAX tracing;"
+echo "       set GEMMA4_MOE_DECODE=loop to halve that at ~24% lower tok/s)"

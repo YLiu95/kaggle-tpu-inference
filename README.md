@@ -26,8 +26,7 @@ cd kaggle-tpu-inference && bash setup.sh
 
 `setup.sh` pulls `HF_TOKEN` from Kaggle secrets, verifies that JAX sees 8 chips,
 downloads the ~52 GB checkpoint over plain HTTP (Xet hangs on Kaggle, see notes),
-and warms the persistent XLA compilation cache so later runs start in ~40 s
-instead of ~6 min.
+and warms the persistent XLA compilation cache (~7 min, once).
 
 ## 2. Run inference
 
@@ -88,7 +87,8 @@ Useful flags: `--plain` (no dashboard, raw ANSI streaming), `--no-think`
 |---|---|
 | weights | 47.0 GiB bf16, 6.1-6.3 GiB per chip (39% HBM), identical on all 8 |
 | weight load + shard | ~14 s |
-| cold start | ~115 s prefill + ~255 s decode compile; ~115 s + ~140 s once the XLA cache is warm (the remainder is JAX tracing/lowering, which is not cached) |
+| cold start | ~115 s prefill + ~255 s decode compile |
+| warm start (cached XLA) | ~14 s load + ~95 s + ~115 s ≈ **3.5 min to first token** — the residue is JAX tracing/lowering, which the persistent cache does *not* skip |
 | prefill | 256-token bucket in 37 ms (~6.9k tok/s padded) |
 | TTFT (67-token prompt) | **58 ms** |
 | decode | **6.7-7.1 ms/token = ~150 tok/s** at batch 1 |
