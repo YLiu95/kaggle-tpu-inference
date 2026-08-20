@@ -250,7 +250,13 @@ def main() -> int:
     console.print(f"[bold]prompt[/] ({len(prompt_ids)} tokens): {args.prompt}\n")
 
     detok = IncrementalDetokenizer(tok)
-    splitter = ChannelSplitter()
+
+    def marker_id(text: str) -> int | None:
+        ids = tok.encode(text, add_special_tokens=False)
+        return ids[0] if len(ids) == 1 else None
+
+    splitter = ChannelSplitter(marker_id("<|channel>"), marker_id("<channel|>"))
+    stop_ids = set(engine.cfg.eos_token_ids)
     segments: list[tuple[str, str]] = []
     stamps: deque[float] = deque(maxlen=24)
 
@@ -289,11 +295,12 @@ def main() -> int:
                     f"{ev['prompt_tokens'] / ev['ttft']:.0f} tok/s prefill)"
                 )
                 t_first = ev["t"]
-            for mode, chunk in splitter.feed(detok.add(ev["token"])):
-                sys.stdout.write(
-                    f"\033[2;33m{chunk}\033[0m" if mode == "reasoning" else chunk
-                )
-                sys.stdout.flush()
+            if ev["token"] not in stop_ids:
+                for mode, chunk in splitter.feed_token(ev["token"], detok.add(ev["token"])):
+                    sys.stdout.write(
+                        f"\033[2;33m{chunk}\033[0m" if mode == "reasoning" else chunk
+                    )
+                    sys.stdout.flush()
             if ev["kind"] == "decode":
                 stamps.append(ev["t"])
         elapsed = time.perf_counter() - (t_first or time.perf_counter())
@@ -323,8 +330,9 @@ def main() -> int:
                 metrics["instant_tps"] = (len(stamps) - 1) / max(span, 1e-9)
                 metrics["itl_ms"] = 1000.0 * span / (len(stamps) - 1)
 
-            for mode, chunk in splitter.feed(detok.add(ev["token"])):
-                segments.append((mode, chunk))
+            if ev["token"] not in stop_ids:
+                for mode, chunk in splitter.feed_token(ev["token"], detok.add(ev["token"])):
+                    segments.append((mode, chunk))
             metrics["phase"] = "reasoning" if splitter.mode == "reasoning" else "answering"
             if splitter.mode == "reasoning":
                 metrics["reasoning_tokens"] += 1

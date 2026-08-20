@@ -5,7 +5,7 @@ A from-scratch **JAX / GSPMD** inference stack for `google/gemma-4-26B-A4B-it`
 streams tokens to the terminal with a live throughput + TPU-utilisation dashboard.
 
 ```
-TTFT ~64 ms  •  ~150 tok/s decode  •  6.7 ms/token  •  47 GiB bf16 weights split 8 ways
+TTFT ~58 ms  •  ~150 tok/s decode  •  6.7 ms/token  •  47 GiB bf16 weights split 8 ways
 ```
 
 Correctness is pinned to HuggingFace `transformers` by a parity test
@@ -42,20 +42,22 @@ Live dashboard (updates ~10x/s while tokens stream):
 
 ```
 ╭──────────────────────────────── Throughput ─────────────────────────────────╮
-│      TTFT       63.6 ms    prompt   61 tok     prefill  959 tok/s   gen  300 │
-│       now   149.83 tok/s      avg  149.55 tok/s    ITL     6.7 ms            │
-│ reasoning   251 tok        answer   49 tok       phase  answering            │
+│      TTFT       57.5 ms    prompt   67 tok     prefill 1164 tok/s   gen  919 │
+│       now   149.83 tok/s      avg  149.64 tok/s    ITL     6.7 ms            │
+│ reasoning   396 tok        answer  523 tok       phase  answering            │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭───────────────────────────── TPU utilisation ───────────────────────────────╮
 │ chip  kind          HBM used   HBM total  used %      peak   duty            │
-│    0  TPU v5 lite   6.29 GiB   15.75 GiB    39.9  6.29 GiB    n/a            │
+│    0  TPU v5 lite   6.12 GiB   15.75 GiB    38.9  6.30 GiB    n/a            │
 │  ...  (all 8 chips, identical -> weights really are sharded 8 ways)          │
-│  tensorcore   98.4% busy (measured: 6.72 ms device time per decode step)     │
-│    achieved     1.15 TFLOP/s   1194.0 GB/s (18.2% of HBM BW)                 │
+│  aggregate   HBM 48.96 / 125.98 GiB over 8 chips   libtpu duty n/a           │
+│ tensorcore   100.0% busy (measured: 7.09 ms device time per decode step)     │
+│   achieved     1.24 TFLOP/s     1270.7 GB/s (19.4% of HBM BW)                │
+│        host   RSS 13.2 GB   CPU 190%                                         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─────────────────────── stream (reasoning dimmed) ───────────────────────────╮
-│ *   Vehicle 1 (Train A): Speed = 60 km/h, starting point = City A.           │
-│ ...                                                                          │
+│ ### 3. Calculate where they meet:                                            │
+│ $$\text{Distance from A} = 60\text{ km/h} \times 3\text{ hours} = 180$$      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -84,13 +86,21 @@ Useful flags: `--plain` (no dashboard, raw ANSI streaming), `--no-think`
 
 | metric | value |
 |---|---|
-| weights | 47.0 GiB bf16, 5.9 GiB per chip (39.9% HBM) |
+| weights | 47.0 GiB bf16, 6.1-6.3 GiB per chip (39% HBM), identical on all 8 |
 | weight load + shard | ~14 s |
-| first compile (cold) | ~115 s prefill + ~255 s decode; cached afterwards |
-| prefill | 256-token bucket in 36.9 ms (~6.9k tok/s padded) |
-| TTFT (61-token prompt) | **64 ms** |
-| decode | **6.72 ms/token = 149 tok/s** at batch 1 |
-| MoE decode variants | `dynamic_slice` **6.72 ms** · `jnp.take` gather 15.21 ms · dense-128 14.18 ms |
+| cold start | ~115 s prefill + ~255 s decode compile; ~115 s + ~140 s once the XLA cache is warm (the remainder is JAX tracing/lowering, which is not cached) |
+| prefill | 256-token bucket in 37 ms (~6.9k tok/s padded) |
+| TTFT (67-token prompt) | **58 ms** |
+| decode | **6.7-7.1 ms/token = ~150 tok/s** at batch 1 |
+| TensorCore busy while streaming | ~100% (async dispatch keeps the queue full) |
+| achieved HBM bandwidth | ~1.2 TB/s aggregate (~19% of the 6.5 TB/s peak) |
+| MoE decode variants | unrolled `dynamic_slice` **6.72 ms** · `fori_loop` 8.79 ms (half the compile time) · `jnp.take` gather 15.21 ms · dense-128 14.18 ms |
+
+Example end-to-end result (`--max-new-tokens 1024 --temperature 1.0`): 919 tokens
+(396 reasoning + 523 answer) at 149.6 tok/s, correct answer, natural stop.
+
+Set `GEMMA4_MOE_DECODE=loop` to halve decode compile time at ~24% lower throughput,
+or `=take` / use `--ablate densemoe` in `bench.py` to reproduce the comparison.
 
 ---
 
@@ -166,9 +176,11 @@ is a live hazard for other agents doing AI work on Kaggle TPUs.
   upper 3/4 of each head is NoPE (zero inverse frequency); `final_logit_softcapping=30`;
   the MoE branch consumes the residual *before* the dense MLP's pre-norm; and
   `embed_scale = bf16(sqrt(2816)) = 53.0`, not 53.066.
-- **Reasoning tokens** are delimited by `<|channel>thought` ... `<channel|>` and only
-  appear when the chat template is rendered with `enable_thinking=True`. The markers can
-  straddle a token boundary, so the splitter buffers partial suffixes.
+- **Reasoning tokens** are delimited by the single-token markers `<|channel>` (id 100) and
+  `<channel|>` (id 101) and only appear when the chat template is rendered with
+  `enable_thinking=True`. Split on **token ids**, not decoded text — a text-based splitter
+  silently classified an entire 768-token generation as "reasoning". Also suppress the
+  stop token (`<turn|>`, id 106) or it gets printed as literal text.
 - *Unresolved:* transparent hugepages are disabled in the Kaggle image, which JAX warns
   slows TPU runtime start/stop; enabling it needs host root access.
 - *Unresolved:* an earlier attempt in this repo used `vllm-tpu` 0.26.0, which injects

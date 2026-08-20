@@ -259,21 +259,38 @@ def _moe(cfg: TextConfig, lp: dict, flat: jax.Array, dense: bool) -> jax.Array:
         dn_w = jnp.take(down, top_i, axis=0)  # [N, K, H, F]
         return jnp.einsum("nkf,nkhf->nh", act, dn_w)
 
-    # Default decode path: one dynamic-slice per selected expert. N and K are static and
-    # tiny at decode time, and each slice reads only that expert's shard from HBM.
+    # Default decode path: one dynamic-slice per selected expert. Each slice reads only
+    # that expert's shard from HBM, unlike jnp.take which XLA materialises in full.
     n_tokens = flat.shape[0]
+    h_dim = flat.shape[1]
+
+    def expert_out(n: int, k):
+        e = top_i[n, k]
+        gu_w = jax.lax.dynamic_index_in_dim(gate_up, e, axis=0, keepdims=False)
+        gu = jnp.einsum("h,cfh->cf", flat[n], gu_w)
+        a = gelu(gu[0]) * gu[1] * top_w[n, k].astype(gu.dtype)
+        dn_w = jax.lax.dynamic_index_in_dim(down, e, axis=0, keepdims=False)
+        return jnp.einsum("f,hf->h", a, dn_w)
+
     rows = []
     for n in range(n_tokens):
-        acc = None
-        for k in range(cfg.top_k_experts):
-            e = top_i[n, k]
-            gu_w = jax.lax.dynamic_index_in_dim(gate_up, e, axis=0, keepdims=False)
-            gu = jnp.einsum("h,cfh->cf", flat[n], gu_w)
-            a = gelu(gu[0]) * gu[1] * top_w[n, k].astype(gu.dtype)
-            dn_w = jax.lax.dynamic_index_in_dim(down, e, axis=0, keepdims=False)
-            part = jnp.einsum("f,hf->h", a, dn_w)
-            acc = part if acc is None else acc + part
-        rows.append(acc)
+        if mode == "loop":
+            # Rolled: 8x smaller HLO, which matters because tracing/lowering 30 unrolled
+            # layers is most of the cold-start time.
+            rows.append(
+                jax.lax.fori_loop(
+                    0,
+                    cfg.top_k_experts,
+                    lambda k, acc, n=n: acc + expert_out(n, k).astype(jnp.float32),
+                    jnp.zeros((h_dim,), jnp.float32),
+                ).astype(flat.dtype)
+            )
+        else:
+            acc = None
+            for k in range(cfg.top_k_experts):
+                part = expert_out(n, k)
+                acc = part if acc is None else acc + part
+            rows.append(acc)
     return jnp.stack(rows, axis=0)
 
 

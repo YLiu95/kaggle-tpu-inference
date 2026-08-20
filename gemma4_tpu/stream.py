@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-THINK_OPEN = "<|channel>thought"
+THINK_OPEN = "<|channel>"
 THINK_CLOSE = "<channel|>"
 
 
@@ -23,15 +23,35 @@ class IncrementalDetokenizer:
 
 
 class ChannelSplitter:
-    """Splits the raw stream into ``reasoning`` and ``answer`` segments.
+    """Splits the stream into ``reasoning`` and ``answer`` segments.
 
-    Gemma-4 emits its chain of thought between ``<|channel>thought`` and ``<channel|>``.
-    Markers may straddle a token boundary, so partial suffixes are buffered.
+    Gemma-4 wraps its chain of thought in the single-token markers ``<|channel>`` (id 100)
+    and ``<channel|>`` (id 101), immediately followed by the literal channel name
+    ``thought``. Switching on ids is exact; the text markers are a fallback.
     """
 
-    def __init__(self):
-        self.buf = ""
+    def __init__(self, open_id: int | None = None, close_id: int | None = None):
+        self.open_id = open_id
+        self.close_id = close_id
         self.mode = "answer"
+        self.buf = ""
+        self._drop_channel_name = False
+
+    def feed_token(self, token_id: int, delta: str) -> list[tuple[str, str]]:
+        if self.open_id is None:
+            return self.feed(delta)
+        if token_id == self.open_id:
+            self.mode = "reasoning"
+            self._drop_channel_name = True
+            return []
+        if token_id == self.close_id:
+            self.mode = "answer"
+            return []
+        if self._drop_channel_name:
+            self._drop_channel_name = False
+            if delta.strip() in ("thought", ""):
+                return []
+        return [(self.mode, delta)] if delta else []
 
     def feed(self, delta: str) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
