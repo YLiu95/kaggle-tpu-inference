@@ -41,6 +41,7 @@ class Engine:
 
         t0 = time.time()
         self.params = load_params(self.cfg, model_dir, self.mesh, progress=progress)
+        jax.block_until_ready(list(self.params.values()))
         self.load_seconds = time.time() - t0
 
         self.cache = M.init_cache(self.cfg, self.mesh, batch, max_len)
@@ -97,22 +98,26 @@ class Engine:
         return jax.device_put(jnp.asarray(value, dtype), self._repl)
 
     def compile_all(self, bucket: int = PREFILL_BUCKET) -> dict[str, float]:
-        """Warm up XLA compilation for one prefill bucket + the decode step."""
+        """Warm up XLA compilation for one prefill bucket + the decode step.
+
+        Inputs must carry exactly the shardings used by :meth:`generate`, otherwise jit
+        specialises again and the warm-up is wasted.
+        """
         out = {}
         key = jax.random.PRNGKey(0)
         temp, top_p = self._put(0.0, jnp.float32), self._put(1.0, jnp.float32)
+        toks = jax.device_put(jnp.zeros((self.batch, bucket), jnp.int32), self._repl)
 
         t0 = time.perf_counter()
-        tok, self.cache, _ = self.prefill_fn(bucket)(
-            self.params, jnp.zeros((self.batch, bucket), jnp.int32), self.cache,
-            self._put(4), key, temp, top_p,
+        tok, self.cache, pos = self.prefill_fn(bucket)(
+            self.params, toks, self.cache, self._put(4), key, temp, top_p
         )
         jax.block_until_ready(tok)
         out["prefill_compile_s"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        tok, self.cache, _ = self.decode_fn()(
-            self.params, tok, self.cache, self._put(4), key, temp, top_p
+        tok, self.cache, pos = self.decode_fn()(
+            self.params, tok, self.cache, pos, key, temp, top_p
         )
         jax.block_until_ready(tok)
         out["decode_compile_s"] = time.perf_counter() - t0

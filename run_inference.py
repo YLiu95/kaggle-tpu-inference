@@ -13,6 +13,15 @@ os.environ.setdefault("JAX_PLATFORMS", "tpu")
 os.environ.setdefault("HF_HOME", "/root/hf_cache")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+import jax
+
+# Persist XLA binaries: the 30-layer unrolled graphs take minutes to compile once.
+CACHE_DIR = os.environ.get("GEMMA4_XLA_CACHE", "/root/.cache/gemma4_jax")
+os.makedirs(CACHE_DIR, exist_ok=True)
+jax.config.update("jax_compilation_cache_dir", CACHE_DIR)
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -216,13 +225,19 @@ def main() -> int:
     if args.system:
         messages.append({"role": "system", "content": args.system})
     messages.append({"role": "user", "content": args.prompt})
-    prompt_ids = tok.apply_chat_template(
-        messages, add_generation_prompt=True, enable_thinking=args.think, tokenize=True
+    encoded = tok.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        enable_thinking=args.think,
+        tokenize=True,
+        return_dict=True,
     )
+    prompt_ids = encoded["input_ids"] if hasattr(encoded, "keys") else encoded
     if hasattr(prompt_ids, "tolist"):
         prompt_ids = prompt_ids.tolist()
     while isinstance(prompt_ids[0], list):
         prompt_ids = prompt_ids[0]
+    prompt_ids = [int(x) for x in prompt_ids]
 
     console.print(header_panel(engine, args.model))
     console.print(f"[bold]prompt[/] ({len(prompt_ids)} tokens): {args.prompt}\n")

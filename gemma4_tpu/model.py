@@ -16,6 +16,7 @@ Sharding strategy (1-D mesh named ``tp`` over all 8 chips, activations replicate
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import jax
@@ -29,6 +30,10 @@ Pytree = Any
 FULL = "full_attention"
 SLIDING = "sliding_attention"
 NEG_INF = np.float32(-1e30)
+
+# Benchmark-only ablations (see bench.py); read lazily so bench can set them post-import.
+def ablate(name: str) -> bool:
+    return name in os.environ.get("GEMMA4_ABLATE", "").split(",")
 
 
 # --------------------------------------------------------------------------------------
@@ -244,32 +249,54 @@ def _moe(cfg: TextConfig, lp: dict, flat: jax.Array, dense: bool) -> jax.Array:
         act = act * w_full[:, :, None].astype(act.dtype)
         return jnp.einsum("nef,ehf->nh", act, down)
 
-    # Decode: gather only the top-k expert slices. The expert axis is replicated on every
-    # chip, so this stays a local HBM gather (no all-to-all).
-    gu_w = jnp.take(gate_up, top_i, axis=0)  # [N, K, 2, F, H]
-    gu = jnp.einsum("nh,nkcfh->nkcf", flat, gu_w)
-    act = gelu(gu[:, :, 0]) * gu[:, :, 1]
-    act = act * top_w[:, :, None].astype(act.dtype)
-    dn_w = jnp.take(down, top_i, axis=0)  # [N, K, H, F]
-    return jnp.einsum("nkf,nkhf->nh", act, dn_w)
+    mode = os.environ.get("GEMMA4_MOE_DECODE", "slice")
+    if mode == "take":
+        # One fused gather of the top-k slices; simple, but XLA materialises the copy.
+        gu_w = jnp.take(gate_up, top_i, axis=0)  # [N, K, 2, F, H]
+        gu = jnp.einsum("nh,nkcfh->nkcf", flat, gu_w)
+        act = gelu(gu[:, :, 0]) * gu[:, :, 1]
+        act = act * top_w[:, :, None].astype(act.dtype)
+        dn_w = jnp.take(down, top_i, axis=0)  # [N, K, H, F]
+        return jnp.einsum("nkf,nkhf->nh", act, dn_w)
+
+    # Default decode path: one dynamic-slice per selected expert. N and K are static and
+    # tiny at decode time, and each slice reads only that expert's shard from HBM.
+    n_tokens = flat.shape[0]
+    rows = []
+    for n in range(n_tokens):
+        acc = None
+        for k in range(cfg.top_k_experts):
+            e = top_i[n, k]
+            gu_w = jax.lax.dynamic_index_in_dim(gate_up, e, axis=0, keepdims=False)
+            gu = jnp.einsum("h,cfh->cf", flat[n], gu_w)
+            a = gelu(gu[0]) * gu[1] * top_w[n, k].astype(gu.dtype)
+            dn_w = jax.lax.dynamic_index_in_dim(down, e, axis=0, keepdims=False)
+            part = jnp.einsum("f,hf->h", a, dn_w)
+            acc = part if acc is None else acc + part
+        rows.append(acc)
+    return jnp.stack(rows, axis=0)
 
 
 def _layer(cfg, lp, x, layer_type, cos, sin, ck, cv, write_at, mask, kv_len, dense_moe, repl):
     eps = cfg.rms_norm_eps
     residual = x
-    h = rms_norm(x, lp["input_layernorm"], eps)
-    h, ck, cv = _attention(cfg, lp, h, layer_type, cos, sin, ck, cv, write_at, mask, kv_len)
-    h = rms_norm(repl(h), lp["post_attention_layernorm"], eps)
-    x = residual + h
+    if not ablate("attn"):
+        h = rms_norm(x, lp["input_layernorm"], eps)
+        h, ck, cv = _attention(cfg, lp, h, layer_type, cos, sin, ck, cv, write_at, mask, kv_len)
+        h = rms_norm(repl(h), lp["post_attention_layernorm"], eps)
+        x = residual + h
 
     residual = x
-    h = repl(_dense_mlp(lp, rms_norm(x, lp["pre_feedforward_layernorm"], eps)))
+    if ablate("mlp"):
+        h = x
+    else:
+        h = repl(_dense_mlp(lp, rms_norm(x, lp["pre_feedforward_layernorm"], eps)))
 
-    if cfg.enable_moe_block:
+    if cfg.enable_moe_block and not ablate("moe"):
         h1 = rms_norm(h, lp["post_feedforward_layernorm_1"], eps)
         b, t, hid = residual.shape
         h2 = rms_norm(residual.reshape(-1, hid), lp["pre_feedforward_layernorm_2"], eps)
-        h2 = repl(_moe(cfg, lp, h2, dense_moe).reshape(b, t, hid))
+        h2 = repl(_moe(cfg, lp, h2, dense_moe or ablate("densemoe")).reshape(b, t, hid))
         h2 = rms_norm(h2, lp["post_feedforward_layernorm_2"], eps)
         h = h1 + h2
 
@@ -304,7 +331,9 @@ def forward(
     shard_h = NamedSharding(mesh, P(None, None, "tp"))
 
     def repl(v):
-        return jax.lax.with_sharding_constraint(v, repl3)
+        return jax.lax.with_sharding_constraint(
+            v, NamedSharding(mesh, P(*([None] * v.ndim)))
+        )
 
     embed = params["embed"]
     x = repl(jnp.take(embed, tokens, axis=0))
@@ -327,6 +356,10 @@ def forward(
     x = rms_norm(x, params["norm"], cfg.rms_norm_eps)
     if last_index is not None:
         x = jax.lax.dynamic_slice_in_dim(x, last_index, 1, axis=1)
+
+    if ablate("lmhead"):
+        logits = jnp.zeros(x.shape[:2] + (cfg.vocab_size,), jnp.float32) + x[..., :1]
+        return logits, {"k": ks, "v": vs}
 
     logits = jnp.einsum("bth,vh->btv", jax.lax.with_sharding_constraint(x, shard_h), embed)
     logits = jax.lax.with_sharding_constraint(logits, repl3).astype(jnp.float32)
