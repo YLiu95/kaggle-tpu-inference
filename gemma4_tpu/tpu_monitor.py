@@ -10,6 +10,7 @@ Two independent sources are combined:
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 from dataclasses import dataclass, field
@@ -47,6 +48,15 @@ class Snapshot:
     def mean_duty(self) -> float | None:
         vals = [c.duty_cycle for c in self.chips if c.duty_cycle is not None]
         return sum(vals) / len(vals) if vals else None
+
+    def to_dict(self) -> dict:
+        return {
+            "chips": [dataclasses.asdict(c) for c in self.chips],
+            "duty_source": self.duty_source,
+            "host_rss_gb": self.host_rss_gb,
+            "host_cpu_pct": self.host_cpu_pct,
+            "timestamp": self.timestamp,
+        }
 
 
 class TpuMonitor:

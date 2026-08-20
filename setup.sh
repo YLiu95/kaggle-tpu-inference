@@ -50,8 +50,11 @@ echo "==> Warming the XLA compilation cache (one-off, ~7 min)"
 cd "$ROOT"
 python3 -u bench.py --steps 8
 
+echo "==> Starting the persistent TPU daemon"
+bash "$ROOT/serve.sh" start
+
 echo
 echo "Setup complete. Weights: $GEMMA4_MODEL_DIR"
 echo "Run:  bash run.sh \"your prompt here\""
-echo "      (~3.5 min from launch to first token: 15 s weight load + JAX tracing;"
-echo "       set GEMMA4_MOE_DECODE=loop to halve that at ~24% lower tok/s)"
+echo "      Weights stay sharded on the TPU, so every later run starts instantly."
+echo "      bash serve.sh status | stop | restart | logs"

@@ -26,9 +26,11 @@ cd kaggle-tpu-inference && bash setup.sh
 
 `setup.sh` pulls `HF_TOKEN` from Kaggle secrets, verifies that JAX sees 8 chips,
 downloads the ~52 GB checkpoint over plain HTTP (Xet hangs on Kaggle, see notes),
-and warms the persistent XLA compilation cache (~7 min, once).
+warms the persistent XLA compilation cache (~7 min, once), and starts the **persistent
+TPU daemon** so the weights stay sharded across the 8 chips and the XLA programs stay
+compiled between runs.
 
-## 2. Run inference
+## 2. Run inference (re-runnable, instant)
 
 ```bash
 # --- RUN --------------------------------------------------------------------
@@ -36,6 +38,24 @@ cd /root/kaggle-tpu-inference && \
 bash run.sh "Explain why a systolic array suits matrix multiplication, then work through a 2x2 example." \
      --max-new-tokens 768 --temperature 1.0
 ```
+
+Re-run that command with any prompt as often as you like: it talks to the daemon over a
+Unix socket, so there is **no reload and no recompile** — first token in ~38 ms.
+
+```
+$ bash run.sh "..."          # 1st time after setup: instant (daemon already up)
+using persistent TPU daemon (pid 78944, up 658s, 4 prior requests)
+TTFT 38 ms  •  149.4 tok/s
+
+$ bash serve.sh status       # pid / uptime / requests / decode step time
+$ bash serve.sh stop         # release the 8 chips
+$ bash serve.sh restart
+$ bash serve.sh logs
+```
+
+If the daemon is not running, `run.sh` starts it automatically (~6 min the very first
+time, ~3.5 min afterwards) and then streams. Pass `--local` to skip the daemon entirely
+and load everything in-process instead.
 
 Live dashboard (updates ~10x/s while tokens stream):
 
@@ -88,7 +108,8 @@ Useful flags: `--plain` (no dashboard, raw ANSI streaming), `--no-think`
 | weights | 47.0 GiB bf16, 6.1-6.3 GiB per chip (39% HBM), identical on all 8 |
 | weight load + shard | ~14 s |
 | cold start | ~115 s prefill + ~255 s decode compile |
-| warm start (cached XLA) | ~14 s load + ~95 s + ~115 s ≈ **3.5 min to first token** — the residue is JAX tracing/lowering, which the persistent cache does *not* skip |
+| warm start (cached XLA) | ~14 s load + ~95 s + ~115 s ≈ 3.5 min — the residue is JAX tracing/lowering, which the persistent cache does *not* skip |
+| **repeat run via the daemon** | **~0 s startup, TTFT 38 ms** |
 | prefill | 256-token bucket in 37 ms (~6.9k tok/s padded) |
 | TTFT (67-token prompt) | **58 ms** |
 | decode | **6.7-7.1 ms/token = ~150 tok/s** at batch 1 |
@@ -107,16 +128,20 @@ or `=take` / use `--ablate densemoe` in `bench.py` to reproduce the comparison.
 ## Repo layout
 
 ```
-setup.sh              one-time environment + weights + XLA cache warm-up
-run.sh                streaming inference entry point
-run_inference.py      CLI, rich dashboard, reasoning/answer channel split
+setup.sh              one-time environment + weights + XLA cache + daemon start
+serve.sh              start/status/stop/restart/logs for the persistent TPU daemon
+run.sh                streaming inference entry point (auto-starts the daemon)
+run_inference.py      CLI: daemon client, or in-process fallback
 bench.py              decode microbenchmark + ablation harness
 gemma4_tpu/
   config.py           Gemma-4 text config loader
   model.py            the JAX model: attention, MoE, RoPE, masks, sampling, sharding
   weights.py          streaming safetensors -> sharded device arrays
   engine.py           jitted prefill/decode + async-dispatch streaming loop
-  stream.py           incremental detokeniser + <|channel>thought splitter
+  server.py           persistent daemon: holds the TPU, serves generations over a socket
+  session.py          unified event stream (local or remote) + prompt building
+  ui.py               rich dashboard rendering, driven purely by events
+  stream.py           incremental detokeniser + reasoning-channel splitter
   tpu_monitor.py      per-chip HBM / duty-cycle sampling
 tests/test_parity.py  HF transformers numerical parity check
 ```
@@ -161,7 +186,10 @@ is a live hazard for other agents doing AI work on Kaggle TPUs.
   `jax_persistent_cache_min_compile_time_secs=1.0`) — but note the cache only skips the
   XLA backend compile, **not** JAX tracing/lowering (~95 s here). Any change to input
   *shardings* (e.g. an uncommitted `jnp.zeros` vs a `device_put` with `NamedSharding`)
-  silently invalidates the cache and forces a full recompile.
+  silently invalidates the cache and forces a full recompile. Because none of this can be
+  cached away, the only real fix is to **not exit the process**: keep a daemon resident
+  that owns the TPU, the sharded weights and the compiled executables
+  (`serve.sh` / `gemma4_tpu/server.py`), and drive it from a thin socket client.
 - **Warm-up must use the exact same shardings as the real call**, otherwise `jit`
   respecialises and your first "real" request pays the whole compile again (this showed
   up as a 148 s TTFT).
