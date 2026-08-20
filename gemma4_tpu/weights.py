@@ -27,9 +27,9 @@ def _to_numpy(t) -> np.ndarray:
     return t.contiguous().numpy()
 
 
-def checkpoint_key_map(cfg: TextConfig) -> dict[str, str]:
+def checkpoint_key_map(cfg: TextConfig, prefix: str = "model.language_model.") -> dict[str, str]:
     """checkpoint tensor name -> flat parameter name used by :mod:`model`."""
-    lm = "model.language_model."
+    lm = prefix
     out = {lm + "embed_tokens.weight": "embed", lm + "norm.weight": "norm"}
     simple = [
         "input_layernorm",
@@ -65,6 +65,22 @@ def _reshape(cfg: TextConfig, flat_name: str, arr: np.ndarray) -> np.ndarray:
     if arr.size != int(np.prod(target)):
         raise ValueError(f"{flat_name}: checkpoint shape {arr.shape} != expected {target}")
     return arr.reshape(target)
+
+
+def params_from_arrays(cfg: TextConfig, get, names, mesh: Mesh, prefix: str = "model.language_model."):
+    """Build sharded params from any ``name -> numpy array`` accessor."""
+    shapes = param_shapes(cfg)
+    specs = param_specs(cfg)
+    key_map = checkpoint_key_map(cfg, prefix)
+    params: dict[str, jax.Array] = {}
+    for ck in names:
+        flat = key_map.get(ck)
+        if flat is None or flat not in shapes or flat in params:
+            continue
+        arr = _reshape(cfg, flat, get(ck))
+        params[flat] = jax.device_put(arr, NamedSharding(mesh, specs[flat]))
+        del arr
+    return params
 
 
 def load_params(
