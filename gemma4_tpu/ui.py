@@ -185,6 +185,13 @@ def run_ui(events, console: Console, plain: bool = False, refresh: float = 10.0)
                 continue
             if kind == "tpu":
                 snap = ev
+            elif kind == "limit":
+                console.print(
+                    f"[yellow]max-new-tokens adjusted:[/] {ev['requested']:,} -> "
+                    f"[bold]{ev['allowed']:,}[/] "
+                    f"(prompt {ev['prompt_tokens']:,} + output must fit the "
+                    f"{ev['context_tokens']:,}-token resident cache)"
+                )
             elif kind in ("prefill", "token"):
                 now = ev["t"]
                 if kind == "prefill":

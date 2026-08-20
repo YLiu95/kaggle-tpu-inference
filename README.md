@@ -5,7 +5,7 @@ A from-scratch **JAX / GSPMD** inference stack for `google/gemma-4-26B-A4B-it`
 streams tokens to the terminal with a live throughput + TPU-utilisation dashboard.
 
 ```
-TTFT ~58 ms  •  ~150 tok/s decode  •  6.7 ms/token  •  47 GiB bf16 weights split 8 ways
+TTFT 44-69 ms  •  ~111 tok/s decode at 32K  •  47 GiB bf16 weights split 8 ways
 ```
 
 Correctness is pinned to HuggingFace `transformers` by a parity test
@@ -40,12 +40,17 @@ bash run.sh "Explain why a systolic array suits matrix multiplication, then work
 ```
 
 Re-run that command with any prompt as often as you like: it talks to the daemon over a
-Unix socket, so there is **no reload and no recompile** — first token in ~38 ms.
+Unix socket, so there is **no reload and no recompile** — first token in tens of ms.
+
+The daemon reserves a **32,768-token context cache** on the v5e-8. `--max-new-tokens`
+is adjusted automatically instead of failing: a request for 32,768 new tokens with a
+54-token rendered prompt becomes 32,714, while a request for 5,000 remains 5,000. The
+terminal prints the adjustment before generation.
 
 ```
 $ bash run.sh "..."          # 1st time after setup: instant (daemon already up)
 using persistent TPU daemon (pid 78944, up 658s, 4 prior requests)
-TTFT 38 ms  •  149.4 tok/s
+TTFT 44 ms  •  110.7 tok/s (32K resident cache)
 
 $ bash serve.sh status       # pid / uptime / requests / decode step time
 $ bash serve.sh stop         # release the 8 chips
@@ -53,25 +58,25 @@ $ bash serve.sh restart
 $ bash serve.sh logs
 ```
 
-If the daemon is not running, `run.sh` starts it automatically (~6 min the very first
-time, ~3.5 min afterwards) and then streams. Pass `--local` to skip the daemon entirely
-and load everything in-process instead.
+If the daemon is not running, `run.sh` starts it automatically (a cold 32K compile can
+take several minutes) and then streams. Pass `--local` to skip the daemon entirely and
+load everything in-process instead.
 
 Live dashboard (updates ~10x/s while tokens stream):
 
 ```
 ╭──────────────────────────────── Throughput ─────────────────────────────────╮
-│      TTFT       57.5 ms    prompt   67 tok     prefill 1164 tok/s   gen  919 │
-│       now   149.83 tok/s      avg  149.64 tok/s    ITL     6.7 ms            │
-│ reasoning   396 tok        answer  523 tok       phase  answering            │
+│      TTFT       44.0 ms    prompt   32 tok      prefill 726 tok/s   gen  352 │
+│       now   110.73 tok/s      avg  110.73 tok/s    ITL     9.0 ms            │
+│ reasoning   347 tok        answer    5 tok       phase  done                 │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭───────────────────────────── TPU utilisation ───────────────────────────────╮
 │ chip  kind          HBM used   HBM total  used %      peak   duty            │
 │    0  TPU v5 lite   6.12 GiB   15.75 GiB    38.9  6.30 GiB    n/a            │
 │  ...  (all 8 chips, identical -> weights really are sharded 8 ways)          │
 │  aggregate   HBM 48.96 / 125.98 GiB over 8 chips   libtpu duty n/a           │
-│ tensorcore   100.0% busy (measured: 7.09 ms device time per decode step)     │
-│   achieved     1.24 TFLOP/s     1270.7 GB/s (19.4% of HBM BW)                │
+│ tensorcore   100.0% busy (measured: 9.41 ms device time per decode step)     │
+│   achieved     0.85 TFLOP/s      940.0 GB/s (14.3% of HBM BW)                │
 │        host   RSS 13.2 GB   CPU 190%                                         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─────────────────────── stream (reasoning dimmed) ───────────────────────────╮
@@ -81,7 +86,7 @@ Live dashboard (updates ~10x/s while tokens stream):
 ```
 
 Useful flags: `--plain` (no dashboard, raw ANSI streaming), `--no-think`
-(skip the reasoning channel), `--max-len`, `--top-p`, `--top-k`, `--seed`,
+(skip the reasoning channel), `--top-p`, `--top-k`, `--seed`,
 `--system`, `--model-dir`.
 
 ---
@@ -109,16 +114,19 @@ Useful flags: `--plain` (no dashboard, raw ANSI streaming), `--no-think`
 | weight load + shard | ~14 s |
 | cold start | ~115 s prefill + ~255 s decode compile |
 | warm start (cached XLA) | ~14 s load + ~95 s + ~115 s ≈ 3.5 min — the residue is JAX tracing/lowering, which the persistent cache does *not* skip |
-| **repeat run via the daemon** | **~0 s startup, TTFT 38 ms** |
+| **repeat run via the daemon** | **~0 s startup, TTFT 44-69 ms** |
+| resident context / max output | 32,768 tokens / prompt-adjusted 32,768 tokens |
+| 32K KV-cache footprint | ~1.41 GiB/chip; projected total ~7.7/15.75 GiB HBM/chip |
 | prefill | 256-token bucket in 37 ms (~6.9k tok/s padded) |
 | TTFT (67-token prompt) | **58 ms** |
-| decode | **6.7-7.1 ms/token = ~150 tok/s** at batch 1 |
+| decode, 32K resident cache | **~9.4 ms/token = ~111 tok/s** at batch 1 |
 | TensorCore busy while streaming | ~100% (async dispatch keeps the queue full) |
 | achieved HBM bandwidth | ~1.2 TB/s aggregate (~19% of the 6.5 TB/s peak) |
 | MoE decode variants | unrolled `dynamic_slice` **6.72 ms** · `fori_loop` 8.79 ms (half the compile time) · `jnp.take` gather 15.21 ms · dense-128 14.18 ms |
 
-Example end-to-end result (`--max-new-tokens 1024 --temperature 1.0`): 919 tokens
-(396 reasoning + 523 answer) at 149.6 tok/s, correct answer, natural stop.
+Live limit validation: `--max-new-tokens 5000` was admitted unchanged; 32,768 became
+32,736 for a 32-token prompt. Both requests generated 352 tokens (347 reasoning + 5
+answer), stopped naturally, and ran at 110.7 tok/s.
 
 Set `GEMMA4_MOE_DECODE=loop` to halve decode compile time at ~24% lower throughput,
 or `=take` / use `--ablate densemoe` in `bench.py` to reproduce the comparison.
@@ -153,6 +161,12 @@ tests/test_parity.py  HF transformers numerical parity check
 Problems hit while building this, and what fixed them. Anything marked *unresolved*
 is a live hazard for other agents doing AI work on Kaggle TPUs.
 
+- **Large outputs originally failed before inference.** The daemon had a hard-coded
+  4,096-token KV cache, so even `--max-new-tokens 5000` raised
+  `prompt + max_new exceeds max_len`. The v5e-8 can comfortably hold the model plus a
+  32,768-token cache (~7.7/15.75 GiB projected HBM per chip). The daemon now reserves
+  32K and automatically clamps output to `min(requested, 32768 - prompt_tokens)`, with
+  the adjustment printed in the terminal instead of failing.
 - **`huggingface_hub` Xet transfer hangs.** The 50 GB shard downloaded to full size,
   then the process sat in `futex_wait` forever with the blob still named `*.incomplete`
   and an unwritten safetensors header, so `safe_open()` also hung. Fix: set

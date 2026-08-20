@@ -12,6 +12,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from . import model as M
 from .config import TextConfig, load_text_config
+from .limits import MAX_OUTPUT_TOKENS, allowed_output_tokens
 from .weights import active_params_per_token, load_params, param_bytes
 
 PREFILL_BUCKET = 256
@@ -156,10 +157,10 @@ class Engine:
         """
         stop = set(stop_ids if stop_ids is not None else self.cfg.eos_token_ids)
         p_len = len(prompt_ids)
-        if p_len + max_new_tokens > self.max_len:
-            raise ValueError(
-                f"prompt({p_len}) + max_new({max_new_tokens}) exceeds max_len={self.max_len}"
-            )
+        available = self.max_len - p_len
+        if available < 1:
+            raise ValueError(f"prompt({p_len}) fills the resident context ({self.max_len})")
+        max_new_tokens = allowed_output_tokens(max_new_tokens, p_len, self.max_len)
         bucket = min(_round_up(p_len, PREFILL_BUCKET), self.max_len)
 
         self.reset_cache()

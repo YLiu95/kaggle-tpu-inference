@@ -32,6 +32,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gemma4_tpu.engine import Engine  # noqa: E402
+from gemma4_tpu.limits import DEFAULT_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS  # noqa: E402
 from gemma4_tpu.session import (  # noqa: E402
     SOCKET_PATH,
     generate_events,
@@ -85,13 +86,15 @@ class Daemon:
             "requests": self.requests,
             "busy": self.lock.locked(),
             "max_len": self.engine.max_len,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
             "decode_step_ms": round(1000 * self.engine.decode_step_seconds, 2),
         }
 
     # ------------------------------------------------------------------ serving
     def handle(self, conn: socket.socket):
         conn.settimeout(600.0)
-        with conn, conn.makefile("rw") as f:
+        f = conn.makefile("rw")
+        try:
             line = f.readline()
             if not line.strip():
                 return
@@ -133,6 +136,12 @@ class Daemon:
                     pass
             finally:
                 self.lock.release()
+        finally:
+            try:
+                f.close()
+            except OSError:
+                pass
+            conn.close()
 
     def serve_forever(self):
         if os.path.exists(self.path):
@@ -166,7 +175,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--model-dir", default=None)
-    ap.add_argument("--max-len", type=int, default=4096)
+    ap.add_argument("--max-len", type=int, default=DEFAULT_CONTEXT_TOKENS)
     ap.add_argument("--top-k", type=int, default=64)
     ap.add_argument("--socket", default=SOCKET_PATH)
     args = ap.parse_args()

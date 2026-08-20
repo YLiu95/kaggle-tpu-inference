@@ -25,11 +25,25 @@ case "${1:-start}" in
   start)
     if alive; then echo "daemon already running ($GEMMA4_SOCKET)"; exit 0; fi
     rm -f "$GEMMA4_SOCKET"
-    echo "starting daemon (first start takes ~3.5 min: weight load + XLA tracing)"
+    echo "waiting for all 8 TPU devices to become available"
+    tpu_ready=0
+    for _ in $(seq 1 60); do
+      if JAX_PLATFORMS=tpu python3 -c "import jax; assert len(jax.devices()) == 8" \
+          >/dev/null 2>&1; then
+        tpu_ready=1
+        break
+      fi
+      sleep 5
+    done
+    if [[ $tpu_ready -ne 1 ]]; then
+      echo "TPU devices remained busy for 5 minutes; check for another JAX process"
+      exit 1
+    fi
+    echo "starting 32K daemon (cold start may take several minutes; later prompts are instant)"
     cd "$ROOT"
     nohup python3 -u -m gemma4_tpu.server --socket "$GEMMA4_SOCKET" "${@:2}" >> "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
-    for _ in $(seq 1 90); do
+    for _ in $(seq 1 180); do
       if alive; then
         bash "$0" status
         exit 0
@@ -39,7 +53,7 @@ case "${1:-start}" in
       fi
       sleep 5
     done
-    echo "timed out waiting for daemon; see $LOG"; exit 1
+    echo "timed out waiting 15 minutes for daemon; see $LOG"; exit 1
     ;;
   status)
     python3 -c "

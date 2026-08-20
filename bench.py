@@ -22,6 +22,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gemma4_tpu.engine import Engine  # noqa: E402
+from gemma4_tpu.limits import DEFAULT_CONTEXT_TOKENS  # noqa: E402
 
 MODEL_DIR = os.environ.get(
     "GEMMA4_MODEL_DIR",
@@ -32,7 +33,7 @@ MODEL_DIR = os.environ.get(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-len", type=int, default=4096)
+    ap.add_argument("--max-len", type=int, default=DEFAULT_CONTEXT_TOKENS)
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--ablate", default="", help="comma list: moe,attn,mlp,lmhead,densemoe")
     args = ap.parse_args()

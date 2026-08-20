@@ -21,6 +21,7 @@ from gemma4_tpu.session import (  # noqa: E402
     remote_events,
     send_command,
 )
+from gemma4_tpu.limits import DEFAULT_CONTEXT_TOKENS  # noqa: E402
 from gemma4_tpu.ui import run_ui  # noqa: E402
 
 DEFAULT_MODEL = "google/gemma-4-26B-A4B-it"
@@ -87,7 +88,7 @@ def main() -> int:
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--model-dir", default=None)
     ap.add_argument("--max-new-tokens", type=int, default=768)
-    ap.add_argument("--max-len", type=int, default=4096)
+    ap.add_argument("--max-len", type=int, default=DEFAULT_CONTEXT_TOKENS)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--top-k", type=int, default=64)

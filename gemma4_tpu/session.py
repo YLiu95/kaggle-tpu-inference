@@ -8,6 +8,8 @@ import socket
 import time
 from typing import Iterator
 
+from .limits import MAX_OUTPUT_TOKENS, allowed_output_tokens
+
 SOCKET_PATH = os.environ.get("GEMMA4_SOCKET", "/tmp/gemma4-tpu.sock")
 TPU_SNAPSHOT_INTERVAL = 0.25
 
@@ -67,6 +69,7 @@ def model_info(engine, model_id: str, served_by: str | None = None) -> dict:
         "top_k_experts": cfg.top_k_experts,
         "kv_bytes_per_token": kv_bytes_per_token(cfg),
         "decode_step_s": engine.decode_step_seconds,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
         "served_by": served_by,
     }
 
@@ -86,8 +89,31 @@ def generate_events(engine, tok, monitor, request: dict, info: dict) -> Iterator
     prompt_ids = build_prompt_ids(
         tok, request["prompt"], request.get("system"), request.get("think", True)
     )
+    requested = max(1, int(request.get("max_new_tokens", 768)))
+    allowed = allowed_output_tokens(requested, len(prompt_ids), engine.max_len)
+    info = {
+        **info,
+        "requested_max_new_tokens": requested,
+        "allowed_max_new_tokens": allowed,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+    }
     yield info
     yield {"kind": "prompt", "text": request["prompt"], "tokens": len(prompt_ids)}
+    if allowed < 1:
+        yield {
+            "kind": "error",
+            "message": f"prompt uses {len(prompt_ids)} tokens and fills the {engine.max_len}-token context",
+        }
+        yield {"kind": "done"}
+        return
+    if allowed != requested:
+        yield {
+            "kind": "limit",
+            "requested": requested,
+            "allowed": allowed,
+            "prompt_tokens": len(prompt_ids),
+            "context_tokens": engine.max_len,
+        }
 
     detok = IncrementalDetokenizer(tok)
     splitter = ChannelSplitter(*marker_ids(tok))
@@ -96,7 +122,7 @@ def generate_events(engine, tok, monitor, request: dict, info: dict) -> Iterator
 
     for ev in engine.generate(
         prompt_ids,
-        max_new_tokens=int(request.get("max_new_tokens", 768)),
+        max_new_tokens=allowed,
         temperature=float(request.get("temperature", 1.0)),
         top_p=float(request.get("top_p", 0.95)),
         seed=int(request.get("seed", 0)),
