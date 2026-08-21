@@ -177,9 +177,9 @@ def main() -> int:
         f"[bold]reasoning[/] {metrics['reasoning_tokens']}   "
         f"[bold]answer[/] {metrics['answer_tokens']}"
     )
-    if metrics.get("warnings"):
+    if metrics.get("pending_warnings"):
         console.rule("[bold yellow]limit warnings")
-        for w in metrics["warnings"]:
+        for w in metrics["pending_warnings"]:
             print_warning(console, w)
     return 0
 

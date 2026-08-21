@@ -61,6 +61,15 @@ gemma4_remember_model
 echo "==> HBM fit check for a ${GEMMA4_MAX_LEN}-token context"
 python3 -m gemma4_tpu.fit_check --model-dir "$GEMMA4_MODEL_DIR" --max-len "$GEMMA4_MAX_LEN"
 
+# The warm-up and the daemon both need all 8 chips, and a chip can only be claimed once.
+if python3 -c "
+import sys; sys.path.insert(0, '$ROOT')
+from gemma4_tpu.session import daemon_alive
+sys.exit(0 if daemon_alive('$GEMMA4_SOCKET') else 1)" 2>/dev/null; then
+  echo "==> A daemon already holds the TPU; stopping it so setup can claim the chips"
+  bash "$ROOT/serve.sh" stop
+fi
+
 echo "==> Warming the XLA compilation cache (one-off, several minutes)"
 cd "$ROOT"
 python3 -u bench.py --model "$GEMMA4_MODEL_KEY" --max-len "$GEMMA4_MAX_LEN" --steps 8

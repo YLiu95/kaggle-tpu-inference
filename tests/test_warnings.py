@@ -11,19 +11,32 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gemma4_tpu.session import generate_events  # noqa: E402
+from gemma4_tpu.session import generate_events, model_info  # noqa: E402
 from gemma4_tpu.ui import print_warning  # noqa: E402
 
 
 class FakeConfig:
+    """The 31B's shape, without any of the weights."""
+
     eos_token_ids = (1, 106)
     enable_moe_block = False
     num_experts = 0
     top_k_experts = 0
     hidden_size = 5376
     vocab_size = 262144
-    num_hidden_layers = 4
-    layer_types = ("sliding_attention",) * 3 + ("full_attention",)
+    num_attention_heads = 32
+    num_key_value_heads = 16
+    num_global_key_value_heads = 4
+    head_dim = 256
+    global_head_dim = 512
+    num_hidden_layers = 6
+    layer_types = ("sliding_attention",) * 5 + ("full_attention",)
+
+    def head_dim_for(self, lt):
+        return self.global_head_dim if lt == "full_attention" else self.head_dim
+
+    def kv_heads_for(self, lt):
+        return self.num_global_key_value_heads if lt == "full_attention" else self.num_key_value_heads
 
 
 class FakeTokenizer:
@@ -77,8 +90,7 @@ def events_for(prompt, max_new_tokens, max_len, max_output=None, emit=5, stop=Tr
                safe_prompt_tokens=None):
     engine = FakeEngine(max_len, max_output or max_len, emit, stop_at_end=stop,
                         safe_prompt_tokens=safe_prompt_tokens)
-    info = {"kind": "info", "model": "google/gemma-4-31B-it", "model_key": "31b",
-            "model_max_context": 30720, "num_experts": 0, "top_k_experts": 0}
+    info = model_info(engine, "google/gemma-4-31B-it", served_by="test")
     req = {"prompt": prompt, "max_new_tokens": max_new_tokens, "think": False}
     return engine, list(generate_events(engine, FakeTokenizer(), None, req, info))
 
@@ -150,6 +162,11 @@ def test_info_event_reports_the_effective_limits():
     assert info["requested_max_new_tokens"] == 900
     assert info["allowed_max_new_tokens"] == 900
     assert info["max_output_tokens"] == 16384
+    assert info["model_key"] == "31b"
+    assert info["model_kind"] == "dense"
+    assert info["model_max_context"] == 30720
+    # 5 sliding layers x 16 heads x 256 + 1 full layer x 4 heads x 512, k and v, bf16
+    assert info["kv_bytes_per_token"] == 2 * 2 * (5 * 16 * 256 + 4 * 512)
 
 
 def test_warnings_render_without_crashing():
@@ -160,3 +177,41 @@ def test_warnings_render_without_crashing():
     for e in evs:
         if e["kind"] == "warning":
             print_warning(console, e)
+
+
+def _run_ui_capture(evs, plain):
+    import io
+
+    from rich.console import Console
+    from gemma4_tpu.ui import run_ui
+
+    buf = io.StringIO()
+    console = Console(file=buf, force_terminal=False, width=100)
+    metrics = run_ui(iter(evs), console, plain=plain)
+    return metrics, buf.getvalue()
+
+
+def test_each_warning_is_printed_exactly_once():
+    _, evs = events_for("hello", 50000, 16384)
+    for plain in (True, False):
+        metrics, out = _run_ui_capture(evs, plain)
+        already = out.count("request_exceeds_max_new_tokens")
+        pending = sum(
+            1 for w in metrics["pending_warnings"]
+            if w["code"] == "request_exceeds_max_new_tokens"
+        )
+        assert already + pending == 1, f"plain={plain}: printed {already}, pending {pending}"
+
+
+def test_mid_stream_warning_is_deferred_until_the_dashboard_is_gone():
+    _, evs = events_for("hi", 5, 16384, emit=5, stop=False)
+    metrics, out = _run_ui_capture(evs, plain=False)
+    assert [w["code"] for w in metrics["pending_warnings"]] == ["hit_max_new_tokens"]
+    assert "hit_max_new_tokens" not in out
+
+
+def test_plain_mode_prints_warnings_inline_and_leaves_nothing_pending():
+    _, evs = events_for("hi", 5, 16384, emit=5, stop=False)
+    metrics, out = _run_ui_capture(evs, plain=True)
+    assert metrics["pending_warnings"] == []
+    assert "hit_max_new_tokens" in out

@@ -260,9 +260,10 @@ def run_ui(events, console: Console, plain: bool = False, refresh: float = 10.0)
         if live is not None:
             live.update(render())
             live.stop()
-        for ev in deferred_warnings:
-            print_warning(console, ev)
 
     metrics["answer_text"] = "".join(c for m, c in segments if m == "answer").strip()
     metrics["warnings"] = warnings
+    # Warnings raised while the dashboard owned the terminal could not be printed then;
+    # the caller shows them once the screen is free.
+    metrics["pending_warnings"] = deferred_warnings
     return metrics
