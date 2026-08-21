@@ -1,7 +1,5 @@
 """Gemma-4 TPU inference. Heavy deps are imported lazily so the thin client stays fast."""
 
-from .models import MODELS, ModelSpec, resolve as resolve_model  # noqa: F401
-
 __all__ = [
     "Engine",
     "MODELS",
@@ -26,4 +24,8 @@ def __getattr__(name):
         from . import config
 
         return getattr(config, name)
+    if name in ("MODELS", "ModelSpec", "resolve_model"):
+        from . import models
+
+        return getattr(models, "resolve" if name == "resolve_model" else name)
     raise AttributeError(name)

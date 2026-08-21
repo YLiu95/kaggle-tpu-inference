@@ -7,6 +7,7 @@ from gemma4_tpu.limits import (
     MAX_OUTPUT_TOKENS,
     allowed_output_tokens,
     check_completion,
+    check_prefill_memory,
     check_request,
     env_max_len,
 )
@@ -104,6 +105,22 @@ def test_warns_when_generation_hits_the_budget():
     warnings = check_completion(768, 768, stopped_naturally=False)
     assert codes(warnings) == ["hit_max_new_tokens"]
     assert "--max-new-tokens" in warnings[0].remedy
+
+
+# ---------------------------------------------------------------- check_prefill_memory
+def test_short_prompt_has_no_prefill_warning():
+    assert check_prefill_memory(2000, 4096) == []
+
+
+def test_long_prompt_warns_about_quadratic_prefill():
+    warnings = check_prefill_memory(9000, 4096)
+    assert codes(warnings) == ["prompt_prefill_memory_risk"]
+    assert "9,000 tokens" in warnings[0].message
+    assert "--max-len" in warnings[0].remedy
+
+
+def test_prefill_check_is_skipped_when_the_budget_is_unknown():
+    assert check_prefill_memory(9000, 0) == []
 
 
 # ---------------------------------------------------------------- env override

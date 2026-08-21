@@ -173,3 +173,31 @@ def check_completion(generated: int, allowed: int, stopped_naturally: bool) -> l
             detail={"generated": generated, "allowed": allowed},
         )
     ]
+
+
+def check_prefill_memory(prompt_tokens: int, safe_prompt_tokens: int) -> list[LimitWarning]:
+    """Warn when the prompt is long enough that prefill attention may exhaust HBM.
+
+    Prefill materialises ``[heads, T, T]`` attention scores, so the cost grows with the
+    *square* of the prompt length. On a v5e-8 that, not the KV cache, is what caps how
+    long a prompt can be.
+    """
+    if safe_prompt_tokens <= 0 or prompt_tokens <= safe_prompt_tokens:
+        return []
+    return [
+        LimitWarning(
+            code="prompt_prefill_memory_risk",
+            message=(
+                f"your input is {prompt_tokens:,} tokens; prefill attention scales with the "
+                f"square of the prompt, and only ~{safe_prompt_tokens:,} tokens fit in the "
+                f"HBM left over after the weights and the KV cache, so this request may "
+                f"run out of memory"
+            ),
+            remedy=(
+                "shorten the prompt, or free HBM by serving a smaller resident context "
+                "(`bash serve.sh restart --max-len N` with a smaller N) or a smaller model "
+                "(`--model 12b`)."
+            ),
+            detail={"prompt_tokens": prompt_tokens, "safe_prompt_tokens": safe_prompt_tokens},
+        )
+    ]

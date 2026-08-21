@@ -59,13 +59,13 @@ MODELS: tuple[ModelSpec, ...] = (
         weights_gib=57.2,
         download_gb=62,
         default_context=16384,
-        max_context=32768,
+        max_context=30720,
         default_max_new_tokens=768,
         aliases=("31b-it", "dense", "google/gemma-4-31B-it"),
         notes=(
-            "60 layers, hidden 5376, no MoE. ~7.2 GiB/chip of weights and 180 KiB/token "
-            "of KV per chip, so 16K is the safe default and 32K is the ceiling "
-            "(~12.8/15.75 GiB per chip)."
+            "60 layers, hidden 5376, no MoE. 7.15 GiB/chip of weights and 180 KiB/token "
+            "of KV per chip, so 16K is the safe default; 30,720 is the largest context "
+            "that stays under 80% HBM (12.4/15.75 GiB per chip)."
         ),
     ),
     ModelSpec(

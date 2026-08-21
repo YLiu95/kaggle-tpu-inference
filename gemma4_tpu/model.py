@@ -193,6 +193,35 @@ def validate_sharding(cfg: TextConfig, n_devices: int) -> None:
         )
 
 
+def prefill_attention_bytes_per_chip(cfg: TextConfig, n_devices: int, t: int) -> int:
+    """Peak bytes one layer's attention scores need during a ``t``-token prefill.
+
+    ``scores`` is materialised as ``[b, kv, g, t, t]`` float32 and ``probs`` as bf16, so
+    the cost is quadratic in the prompt length and is what actually limits how long a
+    prompt can be - long before the KV cache does. Full-attention layers are the worst
+    case because their KV is replicated, so every chip carries all the query groups.
+    """
+    worst = 0
+    for lt in set(cfg.layer_types):
+        kv = cfg.kv_heads_for(lt)
+        g = cfg.num_attention_heads // kv
+        heads_per_chip = kv * g if lt == FULL else max(1, kv // n_devices) * g
+        worst = max(worst, heads_per_chip * t * t * 6)  # float32 scores + bf16 probs
+    return worst
+
+
+def safe_prompt_tokens(
+    cfg: TextConfig, n_devices: int, free_bytes: float, bucket: int = 256
+) -> int:
+    """Largest prefill bucket whose attention working set fits in ``free_bytes``."""
+    if free_bytes <= 0:
+        return 0
+    t = bucket
+    while prefill_attention_bytes_per_chip(cfg, n_devices, t + bucket) <= free_bytes:
+        t += bucket
+    return t
+
+
 def hbm_estimate(cfg: TextConfig, n_devices: int, batch: int, max_len: int) -> dict[str, float]:
     """Bytes-per-chip of weights + KV cache, plus the resulting HBM fraction.
 

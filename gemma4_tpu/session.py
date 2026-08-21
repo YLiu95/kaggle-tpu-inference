@@ -8,7 +8,12 @@ import socket
 import time
 from typing import Iterator
 
-from .limits import MAX_OUTPUT_TOKENS, check_completion, check_request
+from .limits import (
+    MAX_OUTPUT_TOKENS,
+    check_completion,
+    check_prefill_memory,
+    check_request,
+)
 from .models import try_resolve
 
 SOCKET_PATH = os.environ.get("GEMMA4_SOCKET", "/tmp/gemma4-tpu.sock")
@@ -76,6 +81,7 @@ def model_info(engine, model_id: str, served_by: str | None = None) -> dict:
         "top_k_experts": cfg.top_k_experts,
         "kv_bytes_per_token": kv_bytes_per_token(cfg),
         "hbm_per_chip_bytes": engine.hbm["total_bytes_per_chip"],
+        "safe_prompt_tokens": getattr(engine, "safe_prompt_tokens", engine.max_len),
         "decode_step_s": engine.decode_step_seconds,
         "max_output_tokens": engine.max_output_tokens,
         "served_by": served_by,
@@ -119,6 +125,10 @@ def generate_events(engine, tok, monitor, request: dict, info: dict) -> Iterator
     if allowed < 1:
         yield {"kind": "done"}
         return
+    for w in check_prefill_memory(
+        len(prompt_ids), getattr(engine, "safe_prompt_tokens", engine.max_len)
+    ):
+        yield w.to_event()
 
     detok = IncrementalDetokenizer(tok)
     splitter = ChannelSplitter(*marker_ids(tok))

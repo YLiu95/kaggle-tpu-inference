@@ -89,7 +89,7 @@ def test_registry_contains_the_31b():
     assert spec.repo_id == "google/gemma-4-31B-it"
     assert spec.kind == "dense"
     assert spec.default_context == 16384
-    assert spec.max_context == 32768
+    assert spec.max_context == 30720
 
 
 def test_aliases_and_repo_ids_resolve():
@@ -199,12 +199,30 @@ def test_31b_weights_and_16k_cache_fit_a_v5e8():
     assert est["total_bytes_per_chip"] / GIB < 0.80 * 15.75
 
 
-def test_31b_at_32k_is_the_documented_ceiling():
+def test_31b_at_its_ceiling_stays_under_the_hbm_safety_line():
     cfg = load_text_config(write_config(GEMMA4_31B_TEXT))
-    est = M.hbm_estimate(cfg, 8, 1, 32768)
+    est = M.hbm_estimate(cfg, 8, 1, resolve("31b").max_context)
     per_chip = est["total_bytes_per_chip"] / GIB
-    assert per_chip < 15.75, "32K must still physically fit"
-    assert per_chip > 0.75 * 15.75, "32K is expected to be tight, hence the 16K default"
+    assert per_chip < 0.80 * 15.75, "the advertised ceiling must actually fit"
+    assert per_chip > 0.70 * 15.75, "the ceiling should not be needlessly conservative"
+
+
+def test_prefill_attention_is_quadratic_and_bounds_prompt_length():
+    cfg = load_text_config(write_config(GEMMA4_31B_TEXT))
+    a = M.prefill_attention_bytes_per_chip(cfg, 8, 1024)
+    b = M.prefill_attention_bytes_per_chip(cfg, 8, 2048)
+    assert b == 4 * a
+    # full-attention layers replicate KV, so they dominate: 32 heads x T^2 x 6 bytes
+    assert a == 32 * 1024 * 1024 * 6
+
+
+def test_safe_prompt_tokens_shrinks_as_hbm_free_space_shrinks():
+    cfg = load_text_config(write_config(GEMMA4_31B_TEXT))
+    roomy = M.safe_prompt_tokens(cfg, 8, 5.0 * GIB)
+    tight = M.safe_prompt_tokens(cfg, 8, 1.0 * GIB)
+    assert roomy > tight > 0
+    assert M.prefill_attention_bytes_per_chip(cfg, 8, roomy) <= 5.0 * GIB
+    assert M.safe_prompt_tokens(cfg, 8, 0) == 0
 
 
 def test_kv_cost_per_token_scales_linearly_with_context():

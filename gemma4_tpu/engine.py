@@ -58,13 +58,26 @@ class Engine:
         self.cache_bytes = M.cache_bytes(self.cfg, batch, max_len)
         self.active_params = active_params_per_token(self.cfg)
         self.decode_step_seconds = 0.0
+        self.safe_prompt_tokens = min(
+            max_len,
+            M.safe_prompt_tokens(
+                self.cfg,
+                self.n_devices,
+                0.85 * (self._hbm_limit() - self.hbm["total_bytes_per_chip"]),
+                PREFILL_BUCKET,
+            ),
+        )
+
+    @staticmethod
+    def _hbm_limit() -> float:
+        try:
+            return float(jax.devices()[0].memory_stats()["bytes_limit"])
+        except Exception:
+            return V5E_HBM_BYTES
 
     def _warn_if_hbm_tight(self) -> None:
         """A too-large --max-len only fails after a multi-minute load; say so up front."""
-        try:
-            limit = float(jax.devices()[0].memory_stats()["bytes_limit"])
-        except Exception:
-            limit = V5E_HBM_BYTES
+        limit = self._hbm_limit()
         used = self.hbm["total_bytes_per_chip"]
         frac = used / limit
         if frac < 0.80:

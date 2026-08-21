@@ -29,9 +29,8 @@ gemma4_pick_model() {
   if [[ -z "$want" && -f "$STATE_FILE" ]]; then want="$(cat "$STATE_FILE")"; fi
 
   local out
-  if ! out="$(cd "$GEMMA4_ROOT" && python3 -m gemma4_tpu.models --shell "$want" 2>&1)"; then
-    echo "$out" >&2
-    echo "" >&2
+  if ! out="$(cd "$GEMMA4_ROOT" && python3 -m gemma4_tpu.models --shell "$want" 2>/dev/null)"; then
+    echo "unknown model: '${want}'" >&2
     (cd "$GEMMA4_ROOT" && python3 -m gemma4_tpu.models) >&2
     return 2
   fi
