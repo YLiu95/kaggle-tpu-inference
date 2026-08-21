@@ -1,4 +1,11 @@
-"""Config loading for Gemma-4 MoE text stack (google/gemma-4-26B-A4B*)."""
+"""Config loading for the Gemma-4 text stack.
+
+Covers both checkpoint families:
+
+* MoE   (``google/gemma-4-26B-A4B-it``) - ``enable_moe_block=true``, expert fields set
+* dense (``google/gemma-4-31B-it``, ``google/gemma-4-12B-it``) - ``enable_moe_block=false``
+  and every ``*_experts`` / ``moe_*`` field either absent or JSON ``null``
+"""
 
 from __future__ import annotations
 
@@ -48,6 +55,15 @@ class TextConfig:
     def k_eq_v_for(self, layer_type: str) -> bool:
         return self.attention_k_eq_v and layer_type == "full_attention"
 
+    def query_groups_for(self, layer_type: str) -> int:
+        return self.num_attention_heads // self.kv_heads_for(layer_type)
+
+
+def _int_or(raw: dict, key: str, default: int) -> int:
+    """Dense checkpoints ship the MoE keys as JSON ``null`` rather than omitting them."""
+    value = raw.get(key)
+    return default if value is None else int(value)
+
 
 def load_text_config(model_dir: str) -> TextConfig:
     with open(os.path.join(model_dir, "config.json")) as f:
@@ -66,7 +82,7 @@ def load_text_config(model_dir: str) -> TextConfig:
         gen_eos = [eos] if isinstance(eos, int) else list(eos)
 
     rope = tc["rope_parameters"]
-    return TextConfig(
+    cfg = TextConfig(
         hidden_size=tc["hidden_size"],
         num_hidden_layers=tc["num_hidden_layers"],
         num_attention_heads=tc["num_attention_heads"],
@@ -75,9 +91,9 @@ def load_text_config(model_dir: str) -> TextConfig:
         num_key_value_heads=tc["num_key_value_heads"],
         num_global_key_value_heads=tc.get("num_global_key_value_heads", tc["num_key_value_heads"]),
         intermediate_size=tc["intermediate_size"],
-        moe_intermediate_size=tc["moe_intermediate_size"],
-        num_experts=tc["num_experts"],
-        top_k_experts=tc["top_k_experts"],
+        moe_intermediate_size=_int_or(tc, "moe_intermediate_size", 0),
+        num_experts=_int_or(tc, "num_experts", 0),
+        top_k_experts=_int_or(tc, "top_k_experts", 0),
         sliding_window=tc["sliding_window"],
         rms_norm_eps=tc["rms_norm_eps"],
         vocab_size=tc["vocab_size"],
@@ -90,3 +106,9 @@ def load_text_config(model_dir: str) -> TextConfig:
         rope_partial_rotary_factor_full=rope["full_attention"].get("partial_rotary_factor", 1.0),
         eos_token_ids=tuple(gen_eos),
     )
+    if cfg.enable_moe_block and not (cfg.num_experts and cfg.top_k_experts and cfg.moe_intermediate_size):
+        raise ValueError(
+            f"{model_dir}: enable_moe_block=true but num_experts/top_k_experts/"
+            "moe_intermediate_size are missing from text_config"
+        )
+    return cfg

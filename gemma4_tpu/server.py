@@ -32,7 +32,8 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gemma4_tpu.engine import Engine  # noqa: E402
-from gemma4_tpu.limits import DEFAULT_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS  # noqa: E402
+from gemma4_tpu.limits import env_max_len  # noqa: E402
+from gemma4_tpu.models import DEFAULT_MODEL_KEY, choices, resolve  # noqa: E402
 from gemma4_tpu.session import (  # noqa: E402
     SOCKET_PATH,
     generate_events,
@@ -41,21 +42,22 @@ from gemma4_tpu.session import (  # noqa: E402
 )
 from gemma4_tpu.tpu_monitor import TpuMonitor  # noqa: E402
 
-DEFAULT_MODEL = "google/gemma-4-26B-A4B-it"
-
 
 class Daemon:
-    def __init__(self, model_id: str, model_dir: str, max_len: int, top_k: int, path: str):
-        self.model_id = model_id
+    def __init__(self, spec, model_dir: str, max_len: int, top_k: int, path: str):
+        self.spec = spec
+        self.model_id = spec.repo_id
         self.path = path
         self.lock = threading.Lock()
         self.requests = 0
         self.started = time.time()
         self._stop = threading.Event()
 
-        log(f"loading {model_id}")
+        log(f"loading {self.model_id} with a {max_len}-token resident context")
         t0 = time.time()
-        self.engine = Engine(model_dir, max_len=max_len, top_k=top_k)
+        self.engine = Engine(
+            model_dir, max_len=max_len, top_k=top_k, max_output_tokens=max_len
+        )
         log(f"weights sharded across {self.engine.n_devices} chips in {time.time() - t0:.1f}s")
 
         from transformers import AutoTokenizer
@@ -82,11 +84,15 @@ class Daemon:
             "kind": "status",
             "pid": os.getpid(),
             "model": self.model_id,
+            "model_key": self.spec.key,
+            "model_kind": self.spec.kind,
             "uptime_s": round(time.time() - self.started, 1),
             "requests": self.requests,
             "busy": self.lock.locked(),
             "max_len": self.engine.max_len,
-            "max_output_tokens": MAX_OUTPUT_TOKENS,
+            "model_max_context": self.spec.max_context,
+            "max_output_tokens": self.engine.max_output_tokens,
+            "hbm_per_chip_gib": round(self.engine.hbm["total_bytes_per_chip"] / 2**30, 2),
             "decode_step_ms": round(1000 * self.engine.decode_step_seconds, 2),
         }
 
@@ -173,15 +179,22 @@ def log(msg: str):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--model", default=DEFAULT_MODEL_KEY, help=f"one of: {', '.join(choices())}")
     ap.add_argument("--model-dir", default=None)
-    ap.add_argument("--max-len", type=int, default=DEFAULT_CONTEXT_TOKENS)
+    ap.add_argument("--max-len", type=int, default=None, help="resident context window")
     ap.add_argument("--top-k", type=int, default=64)
     ap.add_argument("--socket", default=SOCKET_PATH)
     args = ap.parse_args()
 
-    model_dir = resolve_model_dir(args.model, args.model_dir)
-    daemon = Daemon(args.model, model_dir, args.max_len, args.top_k, args.socket)
+    spec = resolve(args.model)
+    max_len = args.max_len or env_max_len(spec.default_context)
+    if max_len > spec.max_context:
+        log(
+            f"WARNING: --max-len {max_len} is above the {spec.max_context} ceiling measured "
+            f"for {spec.repo_id} on a v5e-8; the load may run out of HBM."
+        )
+    model_dir = resolve_model_dir(spec.repo_id, args.model_dir)
+    daemon = Daemon(spec, model_dir, max_len, args.top_k, args.socket)
     daemon.serve_forever()
     return 0
 

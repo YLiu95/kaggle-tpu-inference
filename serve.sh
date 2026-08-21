@@ -2,18 +2,28 @@
 # Persistent TPU inference daemon: keeps the sharded weights and compiled XLA programs
 # resident so `run.sh` starts generating in milliseconds.
 #
-#   bash serve.sh start | status | stop | restart | logs
+#   bash serve.sh start [--model 31b] [--max-len 16384]
+#   bash serve.sh status | stop | restart | logs
+#
+# The 8 chips fit exactly one model at a time, so `restart --model X` is how you switch
+# models or change the resident context window.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export HF_HOME="${HF_HOME:-/root/hf_cache}"
-export GEMMA4_XLA_CACHE="${GEMMA4_XLA_CACHE:-/root/.cache/gemma4_jax}"
-export GEMMA4_SOCKET="${GEMMA4_SOCKET:-/tmp/gemma4-tpu.sock}"
+source "$ROOT/_common.sh"
+
+CMD="${1:-start}"
+shift || true
+
+prev=""
+for a in "$@"; do
+  [[ "$prev" == "--max-len" ]] && export GEMMA4_MAX_LEN="$a"
+  prev="$a"
+done
+gemma4_pick_model "$@" || exit 2
+
 LOG="${GEMMA4_SERVER_LOG:-/root/.cache/gemma4_jax/server.log}"
 PIDFILE=/root/.cache/gemma4_jax/server.pid
-if [[ -z "${GEMMA4_MODEL_DIR:-}" && -f /root/.gemma4_model_dir ]]; then
-  export GEMMA4_MODEL_DIR="$(cat /root/.gemma4_model_dir)"
-fi
 mkdir -p "$(dirname "$LOG")"
 
 alive() { python3 -c "
@@ -21,9 +31,22 @@ import sys; sys.path.insert(0, '$ROOT')
 from gemma4_tpu.session import daemon_alive
 sys.exit(0 if daemon_alive('$GEMMA4_SOCKET') else 1)" 2>/dev/null; }
 
-case "${1:-start}" in
+case "$CMD" in
   start)
-    if alive; then echo "daemon already running ($GEMMA4_SOCKET)"; exit 0; fi
+    if alive; then
+      running="$(python3 -c "
+import sys; sys.path.insert(0, '$ROOT')
+from gemma4_tpu.session import send_command
+print((send_command('status', '$GEMMA4_SOCKET') or {}).get('model_key', '?'))")"
+      if [[ "$running" != "$GEMMA4_MODEL_KEY" ]]; then
+        echo "daemon already running with model '$running', not '$GEMMA4_MODEL_KEY'."
+        echo "The v5e-8 holds one model at a time; switch with:"
+        echo "  bash serve.sh restart --model $GEMMA4_MODEL_KEY"
+        exit 1
+      fi
+      echo "daemon already running ($GEMMA4_SOCKET, model $running)"
+      exit 0
+    fi
     rm -f "$GEMMA4_SOCKET"
     echo "waiting for all 8 TPU devices to become available"
     tpu_ready=0
@@ -39,12 +62,16 @@ case "${1:-start}" in
       echo "TPU devices remained busy for 5 minutes; check for another JAX process"
       exit 1
     fi
-    echo "starting 32K daemon (cold start may take several minutes; later prompts are instant)"
+    echo "starting $GEMMA4_MODEL_ID with a ${GEMMA4_MAX_LEN}-token context"
+    echo "(cold start may take several minutes; later prompts are instant)"
     cd "$ROOT"
-    nohup python3 -u -m gemma4_tpu.server --socket "$GEMMA4_SOCKET" "${@:2}" >> "$LOG" 2>&1 &
+    nohup python3 -u -m gemma4_tpu.server \
+      --socket "$GEMMA4_SOCKET" --model "$GEMMA4_MODEL_KEY" --max-len "$GEMMA4_MAX_LEN" \
+      >> "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
     for _ in $(seq 1 180); do
       if alive; then
+        gemma4_remember_model
         bash "$0" status
         exit 0
       fi
@@ -73,7 +100,8 @@ print('stopping' if send_command('shutdown', '$GEMMA4_SOCKET') else 'daemon not 
     sleep 5
     echo stopped
     ;;
-  restart) bash "$0" stop; bash "$0" start "${@:2}" ;;
-  logs)    tail -n "${2:-40}" -f "$LOG" ;;
-  *) echo "usage: bash serve.sh {start|status|stop|restart|logs}"; exit 2 ;;
+  restart) bash "$0" stop; bash "$0" start "$@" ;;
+  logs)    tail -n "${1:-40}" -f "$LOG" ;;
+  *) echo "usage: bash serve.sh {start|status|stop|restart|logs} [--model KEY] [--max-len N]"
+     exit 2 ;;
 esac

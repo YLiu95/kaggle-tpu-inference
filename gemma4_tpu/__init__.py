@@ -1,6 +1,16 @@
 """Gemma-4 TPU inference. Heavy deps are imported lazily so the thin client stays fast."""
 
-__all__ = ["Engine", "TextConfig", "TpuMonitor", "load_text_config"]
+from .models import MODELS, ModelSpec, resolve as resolve_model  # noqa: F401
+
+__all__ = [
+    "Engine",
+    "MODELS",
+    "ModelSpec",
+    "TextConfig",
+    "TpuMonitor",
+    "load_text_config",
+    "resolve_model",
+]
 
 
 def __getattr__(name):

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Streaming Gemma-4 26B-A4B inference on a Kaggle TPU v5e-8 with live metrics.
+"""Streaming Gemma-4 inference on a Kaggle TPU v5e-8 with live metrics.
 
-Uses the persistent daemon (``serve.sh``) when it is running, so repeat prompts start
-instantly; otherwise falls back to loading and compiling in-process.
+Pick the checkpoint with ``--model`` (``26b-a4b``, ``31b``, ``12b``; ``--list-models``
+prints the table). Uses the persistent daemon (``serve.sh``) when it is running, so
+repeat prompts start instantly; otherwise falls back to loading and compiling in-process.
 """
 
 from __future__ import annotations
@@ -21,10 +22,10 @@ from gemma4_tpu.session import (  # noqa: E402
     remote_events,
     send_command,
 )
-from gemma4_tpu.limits import DEFAULT_CONTEXT_TOKENS  # noqa: E402
-from gemma4_tpu.ui import run_ui  # noqa: E402
+from gemma4_tpu.limits import env_max_len  # noqa: E402
+from gemma4_tpu.models import DEFAULT_MODEL_KEY, choices, describe_table, resolve  # noqa: E402
+from gemma4_tpu.ui import print_warning, run_ui  # noqa: E402
 
-DEFAULT_MODEL = "google/gemma-4-26B-A4B-it"
 console = Console()
 
 
@@ -48,7 +49,7 @@ def local_events(args, request):
     from gemma4_tpu.session import generate_events, model_info, resolve_model_dir
     from gemma4_tpu.tpu_monitor import TpuMonitor
 
-    model_dir = resolve_model_dir(args.model, args.model_dir)
+    model_dir = resolve_model_dir(args.spec.repo_id, args.model_dir)
     console.print(f"[dim]weights:[/] {model_dir}")
     tok = AutoTokenizer.from_pretrained(model_dir)
 
@@ -59,7 +60,13 @@ def local_events(args, request):
             if done % 25 == 0 or done == total:
                 status.update(f"[bold]sharding weights {done}/{total}[/]  [dim]{name}[/]")
 
-        engine = Engine(model_dir, max_len=args.max_len, top_k=args.top_k, progress=progress)
+        engine = Engine(
+            model_dir,
+            max_len=args.max_len,
+            top_k=args.top_k,
+            max_output_tokens=args.max_len,
+            progress=progress,
+        )
     console.print(
         f"[green]loaded[/] {engine.param_bytes / 2**30:.1f} GiB in {engine.load_seconds:.1f}s"
     )
@@ -74,7 +81,7 @@ def local_events(args, request):
         "[dim]tip: run `bash serve.sh start` once to keep this state resident and make "
         "later prompts start instantly.[/]"
     )
-    info = model_info(engine, args.model, served_by=None)
+    info = model_info(engine, args.spec.repo_id, served_by=None)
     try:
         yield from generate_events(engine, tok, monitor, request, info)
     finally:
@@ -85,10 +92,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--prompt", default="Explain why TPUs use a systolic array, then give one concrete example of an operation it accelerates.")
     ap.add_argument("--system", default=None)
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--model", default=DEFAULT_MODEL_KEY, help=f"one of: {', '.join(choices())}")
+    ap.add_argument("--list-models", action="store_true")
     ap.add_argument("--model-dir", default=None)
-    ap.add_argument("--max-new-tokens", type=int, default=768)
-    ap.add_argument("--max-len", type=int, default=DEFAULT_CONTEXT_TOKENS)
+    ap.add_argument("--max-new-tokens", type=int, default=None)
+    ap.add_argument("--max-len", type=int, default=None,
+                    help="resident context window; only used with --local")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--top-k", type=int, default=64)
@@ -101,6 +110,16 @@ def main() -> int:
     ap.add_argument("--socket", default=SOCKET_PATH)
     args = ap.parse_args()
 
+    if args.list_models:
+        print(describe_table())
+        return 0
+
+    args.spec = resolve(args.model)
+    if args.max_len is None:
+        args.max_len = env_max_len(args.spec.default_context)
+    if args.max_new_tokens is None:
+        args.max_new_tokens = args.spec.default_max_new_tokens
+
     request = {
         "prompt": args.prompt,
         "system": args.system,
@@ -111,7 +130,7 @@ def main() -> int:
         "think": args.think,
     }
 
-    console.rule("[bold cyan]Gemma-4 26B-A4B / TPU v5e-8 / JAX SPMD")
+    console.rule(f"[bold cyan]{args.spec.label} / TPU v5e-8 / JAX SPMD")
     if args.local and daemon_alive(args.socket):
         console.print(
             "[red]--local cannot claim the TPU while the daemon holds it.[/] "
@@ -120,10 +139,17 @@ def main() -> int:
         return 1
     if not args.local and daemon_alive(args.socket):
         st = send_command("status", args.socket) or {}
+        if st.get("model_key") and st["model_key"] != args.spec.key:
+            console.print(
+                f"[red]the resident daemon is serving '{st['model_key']}', not "
+                f"'{args.spec.key}'.[/] The 8 chips hold one model at a time; switch with\n"
+                f"  [bold]bash serve.sh restart --model {args.spec.key}[/]"
+            )
+            return 1
         console.print(
             f"[green]using persistent TPU daemon[/] "
             f"[dim](pid {st.get('pid')}, up {st.get('uptime_s', 0):.0f}s, "
-            f"{st.get('requests', 0)} prior requests)[/]"
+            f"{st.get('requests', 0)} prior requests, context {st.get('max_len')})[/]"
         )
         events = remote_events(request, args.socket)
     else:
@@ -151,6 +177,10 @@ def main() -> int:
         f"[bold]reasoning[/] {metrics['reasoning_tokens']}   "
         f"[bold]answer[/] {metrics['answer_tokens']}"
     )
+    if metrics.get("warnings"):
+        console.rule("[bold yellow]limit warnings")
+        for w in metrics["warnings"]:
+            print_warning(console, w)
     return 0
 
 

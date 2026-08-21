@@ -22,18 +22,16 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gemma4_tpu.engine import Engine  # noqa: E402
-from gemma4_tpu.limits import DEFAULT_CONTEXT_TOKENS  # noqa: E402
-
-MODEL_DIR = os.environ.get(
-    "GEMMA4_MODEL_DIR",
-    "/root/hf_cache/hub/models--google--gemma-4-26B-A4B-it/snapshots/"
-    "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
-)
+from gemma4_tpu.limits import env_max_len  # noqa: E402
+from gemma4_tpu.models import DEFAULT_MODEL_KEY, choices, resolve  # noqa: E402
+from gemma4_tpu.session import resolve_model_dir  # noqa: E402
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-len", type=int, default=DEFAULT_CONTEXT_TOKENS)
+    ap.add_argument("--model", default=DEFAULT_MODEL_KEY, help=f"one of: {', '.join(choices())}")
+    ap.add_argument("--model-dir", default=None)
+    ap.add_argument("--max-len", type=int, default=None)
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--ablate", default="", help="comma list: moe,attn,mlp,lmhead,densemoe")
     args = ap.parse_args()
@@ -41,8 +39,13 @@ def main() -> int:
     if args.ablate:
         os.environ["GEMMA4_ABLATE"] = args.ablate
 
+    spec = resolve(args.model)
+    max_len = args.max_len or env_max_len(spec.default_context)
+    model_dir = resolve_model_dir(spec.repo_id, args.model_dir)
+    print(f"model {spec.repo_id}  max-len {max_len}\n  {model_dir}", flush=True)
+
     t0 = time.time()
-    eng = Engine(MODEL_DIR, max_len=args.max_len)
+    eng = Engine(model_dir, max_len=max_len, max_output_tokens=max_len)
     print(f"load {time.time() - t0:.1f}s  weights {eng.param_bytes / 2**30:.1f} GiB", flush=True)
 
     ct = eng.compile_all()

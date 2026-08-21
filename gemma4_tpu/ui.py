@@ -28,8 +28,11 @@ def header_panel(info: dict) -> Panel:
     t = Table.grid(padding=(0, 2))
     t.add_column(style="bold cyan", justify="right")
     t.add_column(style="white")
-    t.add_row("model", f"{info['model']}  [dim](bf16, MoE {info['num_experts']}E "
-                       f"top-{info['top_k_experts']})[/]")
+    if info.get("num_experts"):
+        arch = f"bf16, MoE {info['num_experts']}E top-{info['top_k_experts']}"
+    else:
+        arch = "bf16, dense MLP"
+    t.add_row("model", f"{info['model']}  [dim]({arch})[/]")
     t.add_row(
         "params",
         f"{info['param_bytes'] / 2 / 1e9:.1f}B total  |  "
@@ -44,16 +47,29 @@ def header_panel(info: dict) -> Panel:
     t.add_row(
         "sharding",
         f"1-D 'tp' mesh over {info['n_devices']} chips  |  "
-        f"attn heads + MLP + expert-intermediate split",
+        + (
+            "attn heads + MLP + expert-intermediate split"
+            if info.get("num_experts")
+            else "attn heads + MLP intermediate split"
+        ),
     )
+    ceiling = info.get("model_max_context") or info["max_len"]
+    room = "" if ceiling <= info["max_len"] else f"  [dim](ceiling {ceiling:,})[/]"
     t.add_row(
-        "kv cache",
-        f"{info['cache_bytes'] / 2**30:.2f} GiB @ max_len={info['max_len']} "
-        f"({info['kv_bytes_per_token'] / 1024:.0f} KiB/token)",
+        "context",
+        f"{info['max_len']:,} tokens resident{room}  |  KV "
+        f"{info['cache_bytes'] / 2**30:.2f} GiB "
+        f"({info['kv_bytes_per_token'] / 1024:.0f} KiB/token)  |  "
+        f"max-new-tokens cap {info.get('max_output_tokens', info['max_len']):,}",
     )
     if info.get("served_by"):
         t.add_row("session", f"[green]{info['served_by']}[/]")
     return Panel(t, title="[bold]Gemma-4 on TPU v5e-8[/]", border_style="cyan")
+
+
+def print_warning(console: Console, ev: dict) -> None:
+    console.print(f"[bold yellow]warning[/] ({ev.get('code')}): {ev.get('message')}")
+    console.print(f"[dim]  how to fix: {ev.get('remedy')}[/]")
 
 
 def tpu_panel(snap: dict, tokens_per_s: float, info: dict, pos: int) -> Panel:
@@ -150,6 +166,8 @@ def run_ui(events, console: Console, plain: bool = False, refresh: float = 10.0)
     """Consume the unified event stream and draw it. Returns the final metrics."""
     info: dict = {}
     segments: list[tuple[str, str]] = []
+    warnings: list[dict] = []
+    deferred_warnings: list[dict] = []
     stamps: deque[float] = deque(maxlen=24)
     snap: dict = {"chips": []}
     metrics = {
@@ -179,20 +197,19 @@ def run_ui(events, console: Console, plain: bool = False, refresh: float = 10.0)
                 metrics["prompt_tokens"] = ev["tokens"]
                 metrics["pos"] = ev["tokens"]
                 console.print(f"[bold]prompt[/] ({ev['tokens']} tokens): {ev['text']}\n")
-                if not plain and live is None:
-                    live = Live(render(), console=console, refresh_per_second=refresh)
-                    live.start()
                 continue
             if kind == "tpu":
                 snap = ev
-            elif kind == "limit":
-                console.print(
-                    f"[yellow]max-new-tokens adjusted:[/] {ev['requested']:,} -> "
-                    f"[bold]{ev['allowed']:,}[/] "
-                    f"(prompt {ev['prompt_tokens']:,} + output must fit the "
-                    f"{ev['context_tokens']:,}-token resident cache)"
-                )
+            elif kind == "warning":
+                warnings.append(ev)
+                if live is None:
+                    print_warning(console, ev)
+                else:
+                    deferred_warnings.append(ev)
             elif kind in ("prefill", "token"):
+                if not plain and live is None:
+                    live = Live(render(), console=console, refresh_per_second=refresh)
+                    live.start()
                 now = ev["t"]
                 if kind == "prefill":
                     metrics["ttft"] = ev["ttft"]
@@ -243,6 +260,9 @@ def run_ui(events, console: Console, plain: bool = False, refresh: float = 10.0)
         if live is not None:
             live.update(render())
             live.stop()
+        for ev in deferred_warnings:
+            print_warning(console, ev)
 
     metrics["answer_text"] = "".join(c for m, c in segments if m == "answer").strip()
+    metrics["warnings"] = warnings
     return metrics

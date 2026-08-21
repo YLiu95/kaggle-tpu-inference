@@ -1,7 +1,15 @@
-"""Numerical parity check: tiny random Gemma-4 in HF/torch vs. the JAX TPU path.
+"""Numerical parity: tiny random Gemma-4 models in HF/torch vs. this JAX SPMD stack.
 
-Uses the same MoE / sliding+full attention / k==v / softcap structure as the real
-26B-A4B checkpoint, just small enough to run on CPU.
+Two architectures are checked, both reduced to CPU-runnable sizes but keeping every
+structural feature that is easy to get silently wrong:
+
+``moe``    the 26B-A4B shape - MoE block, 8 KV heads sliding / 2 global, k == v, softcap
+``dense``  the 31B shape     - no MoE, 16 KV heads sliding / 4 global (so full-attention
+                               layers shard 8 query groups instead of KV heads)
+
+Run directly (``python3 tests/test_parity.py``) or under pytest. The mesh is 8 devices
+either way, so the sharding, the collectives and the ``k == v`` / partial-RoPE paths are
+all exercised.
 """
 
 from __future__ import annotations
@@ -11,41 +19,69 @@ import os
 import sys
 import tempfile
 
-os.environ.setdefault("JAX_PLATFORMS", "tpu")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import jax
-import jax.numpy as jnp
-import numpy as np
-import torch
+_platform = os.environ.get("GEMMA4_TEST_PLATFORM", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", _platform)
+if _platform == "cpu" and "xla_force_host_platform_device_count" not in os.environ.get(
+    "XLA_FLAGS", ""
+):
+    os.environ["XLA_FLAGS"] = (
+        os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
+    ).strip()
 
-from gemma4_tpu import model as M
-from gemma4_tpu.config import load_text_config
-from gemma4_tpu.weights import _to_numpy, params_from_arrays
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+from gemma4_tpu import model as M  # noqa: E402
+from gemma4_tpu.config import load_text_config  # noqa: E402
+from gemma4_tpu.weights import _to_numpy, params_from_arrays  # noqa: E402
 
 LAYER_TYPES = ["sliding_attention", "full_attention", "sliding_attention", "full_attention"]
 
+ARCHS = {
+    # 26B-A4B shape: MoE, 8 sliding KV heads, 2 global KV heads (16 heads -> 8 groups)
+    "moe": dict(
+        hidden_size=256,
+        intermediate_size=128,
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        num_global_key_value_heads=2,
+        head_dim=32,
+        global_head_dim=64,
+        enable_moe_block=True,
+        num_experts=16,
+        top_k_experts=4,
+        moe_intermediate_size=64,
+    ),
+    # 31B shape: dense MLP, 16 sliding KV heads, 4 global KV heads (32 heads -> 8 groups)
+    "dense": dict(
+        hidden_size=256,
+        intermediate_size=128,
+        num_attention_heads=32,
+        num_key_value_heads=16,
+        num_global_key_value_heads=4,
+        head_dim=32,
+        global_head_dim=64,
+        enable_moe_block=False,
+        num_experts=None,
+        top_k_experts=None,
+        moe_intermediate_size=None,
+    ),
+}
 
-def build_hf():
+
+def build_hf(arch: str):
     from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
     from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
 
     cfg = Gemma4TextConfig(
         vocab_size=1024,
-        hidden_size=256,
-        intermediate_size=128,
-        num_hidden_layers=4,
-        num_attention_heads=16,
-        num_key_value_heads=8,
-        head_dim=32,
-        global_head_dim=64,
-        num_global_key_value_heads=2,
+        num_hidden_layers=len(LAYER_TYPES),
         sliding_window=8,
         layer_types=LAYER_TYPES,
-        num_experts=16,
-        top_k_experts=4,
-        moe_intermediate_size=64,
-        enable_moe_block=True,
         attention_k_eq_v=True,
         final_logit_softcapping=30.0,
         tie_word_embeddings=True,
@@ -63,6 +99,7 @@ def build_hf():
         },
         use_bidirectional_attention="vision",
         attn_implementation="eager",
+        **ARCHS[arch],
     )
     torch.manual_seed(0)
     cfg._experts_implementation = "eager"  # CPU has no aten::_grouped_mm
@@ -70,12 +107,11 @@ def build_hf():
     for p in model.parameters():
         with torch.no_grad():
             p.normal_(0.0, 0.05)
-    model = model.to(torch.bfloat16).eval()
-    return cfg, model
+    return cfg, model.to(torch.bfloat16).eval()
 
 
-def main() -> int:
-    hf_cfg, hf_model = build_hf()
+def run_parity(arch: str) -> dict:
+    hf_cfg, hf_model = build_hf(arch)
 
     with tempfile.TemporaryDirectory() as td:
         raw = {"text_config": hf_cfg.to_dict(), "eos_token_id": [1]}
@@ -83,9 +119,12 @@ def main() -> int:
             json.dump(raw, f, default=str)
         cfg = load_text_config(td)
 
+    assert cfg.enable_moe_block == ARCHS[arch]["enable_moe_block"]
+
     sd = hf_model.state_dict()
     arrays = {k: _to_numpy(v.detach()) for k, v in sd.items()}
     mesh = M.make_mesh()
+    M.validate_sharding(cfg, int(mesh.devices.size))
     with mesh:
         params = params_from_arrays(cfg, arrays.__getitem__, list(arrays), mesh, prefix="model.")
 
@@ -112,19 +151,15 @@ def main() -> int:
         )
         return logits, cache
 
-    logits, cache = jax.jit(run, static_argnums=())(
-        params, jnp.asarray(padded), cache, jnp.int32(seq)
-    )
+    logits, _ = jax.jit(run)(params, jnp.asarray(padded), cache, jnp.int32(seq))
     got = np.asarray(jax.device_get(logits))[0, :seq]
     exp = ref[0, :seq]
 
     err = np.abs(got - exp)
-    rel = err.max() / max(np.abs(exp).max(), 1e-6)
-    top1 = (got.argmax(-1) == exp.argmax(-1)).mean()
-    corr = np.corrcoef(got.ravel(), exp.ravel())[0, 1]
-    print(f"prefill  max|d|={err.max():.4f}  rel={rel:.4f}  top1-match={top1:.3f}  corr={corr:.6f}")
+    top1 = float((got.argmax(-1) == exp.argmax(-1)).mean())
+    corr = float(np.corrcoef(got.ravel(), exp.ravel())[0, 1])
 
-    # sparse (top-k gather) decode path must match the dense prefill path
+    # decode path (sparse top-k MoE gather / single-token dense MLP) must match prefill
     dec_cache = M.init_cache(cfg, mesh, 1, bucket)
     pref_len = seq - 1
     pad2 = np.zeros((1, bucket), np.int32)
@@ -143,15 +178,40 @@ def main() -> int:
     )
     dgot = np.asarray(jax.device_get(dlogits))[0, 0]
     dexp = ref[0, seq - 1]
-    derr = np.abs(dgot - dexp)
-    print(
-        f"decode   max|d|={derr.max():.4f}  "
-        f"argmax {'OK' if dgot.argmax() == dexp.argmax() else 'MISMATCH'}  "
-        f"corr={np.corrcoef(dgot, dexp)[0, 1]:.6f}"
-    )
+    dcorr = float(np.corrcoef(dgot, dexp)[0, 1])
 
-    ok = corr > 0.999 and top1 > 0.9 and np.corrcoef(dgot, dexp)[0, 1] > 0.999
-    print("PARITY", "PASS" if ok else "FAIL")
+    print(
+        f"[{arch}] prefill max|d|={err.max():.4f} top1-match={top1:.3f} corr={corr:.6f}  "
+        f"decode max|d|={np.abs(dgot - dexp).max():.4f} "
+        f"argmax={'OK' if dgot.argmax() == dexp.argmax() else 'MISMATCH'} corr={dcorr:.6f}",
+        flush=True,
+    )
+    return {"corr": corr, "top1": top1, "decode_corr": dcorr,
+            "decode_argmax_ok": bool(dgot.argmax() == dexp.argmax())}
+
+
+def test_parity_moe():
+    r = run_parity("moe")
+    assert r["corr"] > 0.999
+    assert r["top1"] > 0.9
+    assert r["decode_corr"] > 0.999
+
+
+def test_parity_dense_31b_shape():
+    r = run_parity("dense")
+    assert r["corr"] > 0.999
+    assert r["top1"] > 0.9
+    assert r["decode_corr"] > 0.999
+    assert r["decode_argmax_ok"]
+
+
+def main() -> int:
+    ok = True
+    for arch in ARCHS:
+        r = run_parity(arch)
+        good = r["corr"] > 0.999 and r["top1"] > 0.9 and r["decode_corr"] > 0.999
+        print(f"[{arch}] PARITY", "PASS" if good else "FAIL")
+        ok = ok and good
     return 0 if ok else 1
 
 

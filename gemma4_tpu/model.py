@@ -1,9 +1,14 @@
-"""JAX/SPMD implementation of the Gemma-4 MoE text decoder for TPU v5e.
+"""JAX/SPMD implementation of the Gemma-4 text decoder for TPU v5e.
+
+Handles both checkpoint families with one code path: dense models (31B, 12B) simply have
+``enable_moe_block=False``, which drops the router/expert branch and leaves the Megatron
+dense MLP.
 
 Sharding strategy (1-D mesh named ``tp`` over all 8 chips, activations replicated):
 
-* sliding layers  -> q/k/v/o sharded over the 8 KV heads (q heads follow their KV head)
-* full layers     -> q/o sharded over the 8 query groups, KV replicated (only 2 KV heads)
+* sliding layers  -> q/k/v/o sharded over the KV heads (q heads follow their KV head)
+* full layers     -> q/o sharded over the query groups, KV replicated (too few KV heads
+                     to split: 2 on the 26B-A4B, 4 on the 31B)
 * dense MLP       -> Megatron column/row split over ``intermediate_size``
 * MoE experts     -> split over ``moe_intermediate_size`` so every chip keeps all 128
                      experts but only 1/8 of each expert's hidden dim. This keeps the
@@ -159,6 +164,57 @@ def param_specs(cfg: TextConfig) -> dict[str, P]:
 def make_mesh() -> Mesh:
     devs = np.array(jax.devices())
     return Mesh(devs.reshape(devs.size), ("tp",))
+
+
+def validate_sharding(cfg: TextConfig, n_devices: int) -> None:
+    """Fail loudly (and early) if this checkpoint cannot be split over ``n_devices``.
+
+    Every axis the 1-D ``tp`` mesh splits must divide evenly; XLA would otherwise pad
+    silently and waste HBM, or reject the sharding minutes into a load.
+    """
+    problems = []
+
+    def need(value: int, what: str) -> None:
+        if value % n_devices:
+            problems.append(f"{what}={value} is not divisible by {n_devices}")
+
+    need(cfg.hidden_size, "hidden_size")
+    need(cfg.intermediate_size, "intermediate_size")
+    if cfg.enable_moe_block:
+        need(cfg.moe_intermediate_size, "moe_intermediate_size")
+    for lt in set(cfg.layer_types):
+        if lt == SLIDING:
+            need(cfg.kv_heads_for(lt), "num_key_value_heads (sliding layers)")
+        else:
+            need(cfg.query_groups_for(lt), "query groups per KV head (full layers)")
+    if problems:
+        raise ValueError(
+            f"checkpoint cannot be sharded over {n_devices} chips: " + "; ".join(problems)
+        )
+
+
+def hbm_estimate(cfg: TextConfig, n_devices: int, batch: int, max_len: int) -> dict[str, float]:
+    """Bytes-per-chip of weights + KV cache, plus the resulting HBM fraction.
+
+    Sliding layers shard their KV over the chips; full layers replicate it (too few KV
+    heads to split), which is why the two are accounted separately.
+    """
+    weights = sum(2 * math.prod(s) for s in param_shapes(cfg).values()) / n_devices
+    kv_sharded = 0
+    kv_replicated = 0
+    for lt in cfg.layer_types:
+        per_layer = 2 * 2 * batch * max_len * cfg.kv_heads_for(lt) * cfg.head_dim_for(lt)
+        if lt == SLIDING:
+            kv_sharded += per_layer
+        else:
+            kv_replicated += per_layer
+    cache = kv_sharded / n_devices + kv_replicated
+    return {
+        "weights_bytes_per_chip": float(weights),
+        "cache_bytes_per_chip": float(cache),
+        "total_bytes_per_chip": float(weights + cache),
+        "kv_bytes_per_token_per_chip": float(cache / max(1, max_len * batch)),
+    }
 
 
 # --------------------------------------------------------------------------------------

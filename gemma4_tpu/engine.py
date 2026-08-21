@@ -16,6 +16,7 @@ from .limits import MAX_OUTPUT_TOKENS, allowed_output_tokens
 from .weights import active_params_per_token, load_params, param_bytes
 
 PREFILL_BUCKET = 256
+V5E_HBM_BYTES = 15.75 * 2**30
 
 
 def _round_up(x: int, m: int) -> int:
@@ -29,6 +30,7 @@ class Engine:
         max_len: int = 4096,
         batch: int = 1,
         top_k: int = 64,
+        max_output_tokens: int = MAX_OUTPUT_TOKENS,
         progress=None,
     ):
         self.model_dir = model_dir
@@ -36,9 +38,13 @@ class Engine:
         self.max_len = max_len
         self.batch = batch
         self.top_k = top_k
+        self.max_output_tokens = min(max_output_tokens, max_len)
         self.mesh = M.make_mesh()
         self.n_devices = int(self.mesh.devices.size)
         self._repl = NamedSharding(self.mesh, P())
+        M.validate_sharding(self.cfg, self.n_devices)
+        self.hbm = M.hbm_estimate(self.cfg, self.n_devices, batch, max_len)
+        self._warn_if_hbm_tight()
 
         t0 = time.time()
         self.params = load_params(self.cfg, model_dir, self.mesh, progress=progress)
@@ -52,6 +58,34 @@ class Engine:
         self.cache_bytes = M.cache_bytes(self.cfg, batch, max_len)
         self.active_params = active_params_per_token(self.cfg)
         self.decode_step_seconds = 0.0
+
+    def _warn_if_hbm_tight(self) -> None:
+        """A too-large --max-len only fails after a multi-minute load; say so up front."""
+        try:
+            limit = float(jax.devices()[0].memory_stats()["bytes_limit"])
+        except Exception:
+            limit = V5E_HBM_BYTES
+        used = self.hbm["total_bytes_per_chip"]
+        frac = used / limit
+        if frac < 0.80:
+            return
+        gib = 2**30
+        fits = int(
+            (0.80 * limit - self.hbm["weights_bytes_per_chip"])
+            // max(1.0, self.hbm["kv_bytes_per_token_per_chip"])
+        )
+        print(
+            f"WARNING: weights {self.hbm['weights_bytes_per_chip'] / gib:.1f} GiB + "
+            f"KV cache {self.hbm['cache_bytes_per_chip'] / gib:.1f} GiB = "
+            f"{used / gib:.1f} GiB per chip ({100 * frac:.0f}% of {limit / gib:.1f} GiB HBM) "
+            f"at --max-len {self.max_len}.",
+            flush=True,
+        )
+        print(
+            f"         Prefill activations may not fit. Use --max-len {max(256, fits)} "
+            f"or lower for headroom.",
+            flush=True,
+        )
 
     # ---------------------------------------------------------------- jitted steps
     def _build_prefill(self, t: int):
@@ -160,7 +194,9 @@ class Engine:
         available = self.max_len - p_len
         if available < 1:
             raise ValueError(f"prompt({p_len}) fills the resident context ({self.max_len})")
-        max_new_tokens = allowed_output_tokens(max_new_tokens, p_len, self.max_len)
+        max_new_tokens = allowed_output_tokens(
+            max_new_tokens, p_len, self.max_len, self.max_output_tokens
+        )
         bucket = min(_round_up(p_len, PREFILL_BUCKET), self.max_len)
 
         self.reset_cache()
@@ -186,6 +222,8 @@ class Engine:
             "t": time.perf_counter(),
         }
         if first in stop:
+            yield {"kind": "finish", "stopped_naturally": True, "generated": 1,
+                   "allowed": max_new_tokens}
             return
 
         decode = self.decode_fn()
@@ -216,6 +254,14 @@ class Engine:
             for ev in flush(lookahead):
                 yield ev
             if stopped:
+                yield {"kind": "finish", "stopped_naturally": True, "generated": emitted,
+                       "allowed": max_new_tokens}
                 return
         for ev in flush(0):
             yield ev
+        yield {
+            "kind": "finish",
+            "stopped_naturally": stopped,
+            "generated": emitted,
+            "allowed": max_new_tokens,
+        }

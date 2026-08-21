@@ -1,27 +1,37 @@
 #!/usr/bin/env bash
-# One-time setup: verify the TPU, fetch weights, warm the XLA compilation cache.
+# One-time setup: pick a model, verify the TPU, fetch weights, warm the XLA cache,
+# start the persistent daemon.
+#
+#   bash setup.sh                      # default: gemma-4 26B-A4B (MoE)
+#   bash setup.sh --model 31b          # gemma-4 31B instruction-tuned (dense)
+#   bash setup.sh --model 31b --max-len 32768
+#   bash setup.sh --list               # show every supported model
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export HF_HOME="${HF_HOME:-/root/hf_cache}"
-export GEMMA4_XLA_CACHE="${GEMMA4_XLA_CACHE:-/root/.cache/gemma4_jax}"
-export MODEL_ID="${MODEL_ID:-google/gemma-4-26B-A4B-it}"
+source "$ROOT/_common.sh"
+
+if [[ "${1:-}" == "--list" || "${1:-}" == "-l" ]]; then
+  python3 -m gemma4_tpu.models
+  exit 0
+fi
+
+# --max-len here becomes the resident context window of the daemon.
+prev=""
+for a in "$@"; do
+  [[ "$prev" == "--max-len" ]] && export GEMMA4_MAX_LEN="$a"
+  prev="$a"
+done
+
+gemma4_pick_model "$@"
 mkdir -p "$HF_HOME" "$GEMMA4_XLA_CACHE"
 
+echo "==> Model: $GEMMA4_MODEL_ID  [$GEMMA4_MODEL_KEY, $GEMMA4_MODEL_KIND]"
+echo "    context window: ${GEMMA4_MAX_LEN} tokens (ceiling ${GEMMA4_MODEL_MAX_LEN})"
+echo "    change it with: bash setup.sh --model $GEMMA4_MODEL_KEY --max-len N"
+
 echo "==> Kaggle secrets -> environment"
-eval "$(python3 - <<'PY'
-try:
-    from kaggle_secrets import UserSecretsClient
-    s = UserSecretsClient()
-    for name in ("HF_TOKEN", "GITHUB_TOKEN"):
-        try:
-            print(f'export {name}={s.get_secret(name)}')
-        except Exception:
-            pass
-except Exception:
-    pass
-PY
-)"
+gemma4_load_secrets
 
 echo "==> TPU check"
 python3 - <<'PY'
@@ -32,29 +42,35 @@ print(f"  {len(d)} x {d[0].device_kind}, "
 assert len(d) == 8, "expected 8 TPU chips"
 PY
 
-echo "==> Downloading ${MODEL_ID} (~52 GB, Xet is flaky on Kaggle -> plain HTTP)"
+echo "==> Downloading ${GEMMA4_MODEL_ID} (~${GEMMA4_DOWNLOAD_GB} GB, plain HTTP: Xet hangs on Kaggle)"
 HF_HUB_DISABLE_XET=1 python3 - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 p = snapshot_download(
-    os.environ["MODEL_ID"],
+    os.environ["GEMMA4_MODEL_ID"],
     allow_patterns=["*.json", "*.safetensors", "*.jinja", "*.txt", "*.model"],
     max_workers=8,
 )
 print("  weights:", p)
-open("/root/.gemma4_model_dir", "w").write(p)
+open(os.environ["GEMMA4_MODEL_DIR_FILE"], "w").write(p)
 PY
 
-export GEMMA4_MODEL_DIR="$(cat /root/.gemma4_model_dir)"
-echo "==> Warming the XLA compilation cache (one-off, ~7 min)"
+export GEMMA4_MODEL_DIR="$(cat "$GEMMA4_MODEL_DIR_FILE")"
+gemma4_remember_model
+
+echo "==> HBM fit check for a ${GEMMA4_MAX_LEN}-token context"
+python3 -m gemma4_tpu.fit_check --model-dir "$GEMMA4_MODEL_DIR" --max-len "$GEMMA4_MAX_LEN"
+
+echo "==> Warming the XLA compilation cache (one-off, several minutes)"
 cd "$ROOT"
-python3 -u bench.py --steps 8
+python3 -u bench.py --model "$GEMMA4_MODEL_KEY" --max-len "$GEMMA4_MAX_LEN" --steps 8
 
 echo "==> Starting the persistent TPU daemon"
-bash "$ROOT/serve.sh" start
+bash "$ROOT/serve.sh" start --model "$GEMMA4_MODEL_KEY" --max-len "$GEMMA4_MAX_LEN"
 
 echo
-echo "Setup complete. Weights: $GEMMA4_MODEL_DIR"
+echo "Setup complete. Model $GEMMA4_MODEL_ID, weights: $GEMMA4_MODEL_DIR"
 echo "Run:  bash run.sh \"your prompt here\""
 echo "      Weights stay sharded on the TPU, so every later run starts instantly."
 echo "      bash serve.sh status | stop | restart | logs"
+echo "      Switch model: bash setup.sh --model 26b-a4b   (see: bash setup.sh --list)"
